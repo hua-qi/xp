@@ -32,33 +32,35 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="extract_experience",
             description=(
-                "在完成一个代码任务后调用此工具，将本次任务的经验提取并沉淀到知识库（状态为 pending，需人工 review 确认）。"
-                "每次完成有价值的功能实现或 bug 修复时都应调用。"
+                "【任务完成后必做】把这次任务的经验沉淀下来，让团队下次遇到同样问题能秒解！"
+                "只要有任何'原来要这样'、'差点踩坑'、'找到了好方案'的收获，就应该记录。"
+                "哪怕是很小的问题（如：某个参数要这么配、这个库要那样用），都值得沉淀。"
+                "你的记录会帮助未来的自己和同事节省大量时间！"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "task_description": {
                         "type": "string",
-                        "description": "本次任务描述，说明要做什么或遇到了什么问题",
+                        "description": "【必填】你要解决什么问题？一句话说清（如：'用户反馈登录后状态不保持'）",
                     },
                     "solution_summary": {
                         "type": "string",
-                        "description": "解决方案摘要，说明最终如何解决的",
+                        "description": "【必填】最终怎么解决的？核心思路即可（如：'在 token 过期时自动刷新，并存入 localStorage'）",
                     },
                     "key_decisions": {
                         "type": "string",
-                        "description": "关键决策或踩坑点，说明过程中做了哪些重要选择或遇到了哪些坑",
+                        "description": "【必填】有什么坑要注意？这是最有价值的部分（如：'不要在 useEffect 里直接调用 setState，会导致无限循环'）",
                     },
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "技术栈标签，如 ['react', 'typescript', 'hooks']",
+                        "description": "【推荐】涉及的技术栈，方便后续检索（如 ['react', 'hooks', 'auth']）",
                     },
                     "related_files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "本次任务涉及的关键文件路径（可选）",
+                        "description": "【推荐】改了哪些文件？方便追踪失效（如 ['src/hooks/useAuth.ts', 'src/api/client.ts']）",
                     },
                 },
                 "required": ["task_description", "solution_summary", "key_decisions"],
@@ -67,25 +69,32 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_best_practices",
             description=(
-                "在开始编写代码前，根据当前任务描述检索历史最佳实践和 bugfix 经验。"
-                "遇到相似场景或报错时优先调用，返回的经验仅供参考，需结合实际情况判断是否适用。"
+                "【任务开始第一步】在开始任何任务前，先检索团队历史经验，避免重复踩坑！"
+                "检索内容包括：bugfix 方案、代码模式、配置技巧、最佳实践等。"
+                "即使不确定是否有相关经验，也应该调用 - 零成本，高回报。"
+                "返回的经验会告诉你：'前人踩过什么坑'、'推荐怎么解决'、'要注意什么'。"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "任务描述或报错信息",
+                        "description": "【必填】用一句话描述你要做什么（如：'修复 React useEffect 无限循环'、'配置 Docker 网络'）",
                     },
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "技术栈标签，用于过滤（可选）",
+                        "description": "【推荐】技术栈标签，帮助精准匹配（如 ['react', 'typescript']）",
                     },
                     "top_k": {
                         "type": "integer",
                         "description": "返回条数，默认 3",
                         "default": 3,
+                    },
+                    "cross_project": {
+                        "type": "boolean",
+                        "description": "是否跨项目检索（可选，默认 false）",
+                        "default": False,
                     },
                 },
                 "required": ["query"],
@@ -139,8 +148,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="record_feedback",
             description=(
-                "记录检索到的经验是否被采纳，用于动态更新经验 confidence 和识别低质量经验。"
-                "在完成任务后，agent 应评估每个注入的经验是否实际被采用。"
+                "【帮助优化知识库】反馈每条经验对你有没有帮助，让系统越用越聪明！"
+                "如果某条经验帮到了你，标记采纳 - 它会变得更容易被检索到。"
+                "如果没用，标记拒绝并说明原因 - 系统会学习并改进。"
+                "你的反馈直接影响整个团队的知识质量！"
             ),
             inputSchema={
                 "type": "object",
@@ -273,9 +284,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def main():
     global _service
+    from .project_config import ProjectManager
+    project = ProjectManager().get_current()
     store = ExperienceStore()
     metrics = MetricsStore()
-    _service = KnowledgeService(store, metrics)
+    _service = KnowledgeService(store, metrics, project)
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())

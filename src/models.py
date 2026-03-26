@@ -53,6 +53,22 @@ class Experience:
     reject_reason: Optional[str] = None
     similarity: Optional[float] = None  # 向后兼容
     metadata: ExperienceMetadata = field(default_factory=ExperienceMetadata)
+    # Phase 3: 文件追踪
+    file_hashes: dict[str, str] = field(default_factory=dict)  # 文件路径 -> hash
+    project: str = "default"  # 所属项目
+    last_hit_at: Optional[str] = None  # 最后使用时间，用于 TTL
+    stale_reason: Optional[str] = None  # 失效原因
+
+
+@dataclass
+class ProjectConfig:
+    """项目配置"""
+    name: str
+    tags: list[str] = field(default_factory=list)
+    root_path: Optional[str] = None
+    cloud_sync_enabled: bool = False
+    cloud_provider: Optional[str] = None  # supabase/weaviate/elasticsearch
+    cloud_config: dict = field(default_factory=dict)
 
 
 @dataclass

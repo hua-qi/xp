@@ -1,21 +1,27 @@
-# XP - Agent 最佳实践沉淀工具 Phase 1
+# XP - Agent 最佳实践沉淀工具
 
-让 agent 在同项目中越用越聪明：自动沉淀每次任务的经验，下次遇到相似问题时直接复用。
+让 agent 在任何任务中越用越聪明：自动沉淀每次任务的经验，下次遇到相似问题时直接复用。
+
+适用场景：**编码、运维、数据分析、文档编写等任何通过 agent 完成的任务**。
 
 ---
 
 ## 工作原理
 
 ```
-agent 完成任务
+agent 开始任何任务
       ↓
-调用 extract_experience → 生成候选经验（pending）
+调用 search_best_practices → 检索历史经验（零成本，高回报）
       ↓
-你运行 xp review → 确认/拒绝
+    [执行任务]
       ↓
-下次任务开始前，agent 调用 search_best_practices → 检索注入
+调用 extract_experience → 沉淀本次经验（哪怕很小也值得）
       ↓
-任务结束，agent 调用 record_session → 记录效果数据
+调用 record_feedback → 反馈每条经验是否有帮助
+      ↓
+调用 record_session → 记录会话效果数据
+      ↓
+你运行 xp review → 确认/拒绝候选经验
       ↓
 xp stats → 查看工具是否真的有用
 ```
@@ -217,21 +223,34 @@ xp stats
 
 | 命令 | 说明 |
 |---|---|
+| `xp add` | 交互式手动添加经验（支持中文输入） |
 | `xp review` | 逐条确认/拒绝待 review 的候选经验 |
 | `xp import <文件>` | 从 Markdown 文件批量导入种子经验 |
 | `xp stats` | 查看全部时间的效果统计 |
 | `xp stats --since 7d` | 查看最近 7 天的统计 |
 | `xp stats --since 30d` | 查看最近 30 天的统计 |
+| `xp analyze` | 分析经验质量报告（采纳率、拒绝原因等） |
+| `xp project list` | 列出所有项目 |
+| `xp project switch <名>` | 切换到指定项目 |
+| `xp watch` | 检查文件变更和过期经验 |
+| `xp sync up/down` | 云端同步（需配置） |
 
 ---
 
 ## MCP Tools 参考
 
-| Tool | 调用时机 | 谁来调用 |
+| Tool | 调用时机 | 用途 |
 |---|---|---|
-| `search_best_practices` | 任务开始前 | agent 主动调用 |
-| `extract_experience` | 任务完成后 | agent 主动调用 |
-| `record_session` | 任务完成后 | agent 主动调用 |
+| `search_best_practices` | **任务开始前必调** | 检索历史经验，避免重复踩坑 |
+| `extract_experience` | **任务完成后必调** | 沉淀本次任务经验 |
+| `record_feedback` | 任务完成后 | 反馈每条经验是否被采纳 |
+| `record_session` | 任务完成后 | 记录会话效果数据 |
+
+**工作流程：**
+1. 任务开始 → `search_best_practices`（先查后做）
+2. 任务完成 → `extract_experience`（沉淀经验）
+3. 任务完成 → `record_feedback`（反馈采纳情况）
+4. 任务完成 → `record_session`（记录效果）
 
 ---
 
@@ -242,10 +261,10 @@ xp stats
 ```
 ~/.xp/
   knowledge.json    # 经验库
-  index.npy         # 向量索引
-  index_ids.json    # 向量 ID 映射
-  metrics.db        # SQLite 指标库
+  metrics.db        # SQLite 指标库（含检索事件、审核事件、会话记录、反馈记录）
 ```
+
+**注意**：XP 使用 **BM25 纯文本检索**，无需向量索引，零 API 成本。
 
 ---
 

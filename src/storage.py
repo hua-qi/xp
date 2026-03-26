@@ -258,6 +258,10 @@ class ExperienceStore:
                 "scene": exp.metadata.scene,
                 "keywords": exp.metadata.keywords,
             },
+            "file_hashes": exp.file_hashes,
+            "project": exp.project,
+            "last_hit_at": exp.last_hit_at,
+            "stale_reason": exp.stale_reason,
         }
 
     def _from_dict(self, d: dict) -> Experience:
@@ -290,6 +294,10 @@ class ExperienceStore:
             related_files=d.get("related_files", []),
             reject_reason=d.get("reject_reason"),
             metadata=metadata,
+            file_hashes=d.get("file_hashes", {}),
+            project=d.get("project", "default"),
+            last_hit_at=d.get("last_hit_at"),
+            stale_reason=d.get("stale_reason"),
         )
 
 

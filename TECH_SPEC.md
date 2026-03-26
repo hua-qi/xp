@@ -7,28 +7,39 @@
 ## 整体架构
 
 ```
-代码生成事件（agent 完成一次任务）
+agent 开始任何任务
         ↓
-  [agent 自动提取候选经验]
+  [search_best_practices] 检索历史经验
         ↓
-  [人工 review：确认/拒绝/编辑]
+    [执行任务]
         ↓
-   [经验库 + 向量存储]
+  [extract_experience] 沉淀本次经验
         ↓
-   [检索引擎]  ← 任务描述
+  [record_feedback] 反馈经验采纳情况
         ↓
-   [注入适配层] → codeAgent (MCP / Rules / Prompt)
+  [record_session] 记录会话效果
         ↓
-   [反馈采集] → 动态权重更新
+  [人工 review] 确认/拒绝/编辑候选经验
+        ↓
+   [BM25 检索引擎] ← 任务描述
+        ↓
+   [动态权重更新] ← 反馈数据
 ```
 
 ## Phase 1：先有（MVP）
 
 目标： 打通"agent 自动提取候选 → 人工确认 → 检索注入"最小闭环，并记录核心指标供工具有效性判断
 
+**适用范围扩展**：不只是代码生成，任何通过 agent 完成的任务都适用：
+- 编码：bugfix、功能实现、代码模式
+- 运维：部署、配置、故障排查  
+- 数据分析：查询优化、可视化技巧
+- 文档：规范总结、模板提炼
+- 任何你觉得以后可能再遇到的情况
+
 ### 1.1 经验录入：agent 为主
 
-触发时机： agent 每次完成代码生成任务后，由 MCP Server 中的 extract_experience tool 触发，让 agent 自己对刚完成的任务做总结提取。
+触发时机： agent 每次完成任务后，由 MCP Server 中的 extract_experience tool 触发，让 agent 自己对刚完成的任务做总结提取。只要有任何"原来要这样"、"差点踩坑"、"找到了好方案"的收获，就应该记录。
 
 MCP tool 定义：
 
@@ -170,60 +181,63 @@ xp import ./best-practices.md
 ```json
 {
   "name": "record_session",
-  "description": "记录一次完整的代码生成会话数据，用于效果评估",
+  "description": "记录一次完整的会话数据，用于效果评估",
   "inputSchema": {
     "session_id": "string",
     "task_description": "任务描述",
-    "experience_ids_injected": ["检索到并注入的经验 id 列表，无则为空数组"],
+    "experience_ids_injected": ["检索到并参考的经验 id 列表，无则为空数组"],
     "iteration_count": "完成任务的对话轮数",
     "had_error_correction": "过程中是否出现报错并修正（boolean）",
-    "user_accepted": "用户最终是否接受了代码（boolean）"
+    "user_accepted": "用户最终是否接受了结果（boolean）"
   }
 }
 ```
 
-基于 session 数据，可计算以下对比指标：
+基于 session 数据，可计算以下对比指标（有经验注入 vs 无注入）：
 
 | 指标 | 计算方式 | 衡量什么 |
 |------|----------|----------|
-| 有经验注入 vs 无注入的平均轮数 | 按 experience_ids_injected 是否为空分组，对比 iteration_count 均值 | 是否减少了来回修改 |
-| 有经验注入 vs 无注入的报错率 | 按同上分组，对比 had_error_correction 比例 | 是否减少了踩坑 |
-| 用户接受率 | user_accepted = true 的比例，同样按有无注入分组 | 生成质量是否提升 |
-| 经验命中后采纳率 | 注入的经验被 agent 实际使用的比例（需 agent 在 summary 中标注） | 经验的相关性是否够高 |
+| 平均对话轮数 | 按有无经验注入分组，对比 iteration_count 均值 | 是否减少了来回修改 |
+| 报错率 | 按有无经验注入分组，对比 had_error_correction 比例 | 是否减少了踩坑 |
+| 用户接受率 | user_accepted = true 的比例，按有无注入分组 | 生成质量是否提升 |
 
-#### 查看指标
+#### 反馈指标（经验质量）
 
-```bash
-xp stats                  # 输出全部指标摘要
-xp stats --since 7d       # 最近 7 天
-xp stats --metric iter    # 只看轮数对比
+通过 record_feedback MCP tool 收集每条经验的实际使用效果：
+
+```json
+{
+  "name": "record_feedback",
+  "description": "记录检索到的经验是否被采纳",
+  "inputSchema": {
+    "experience_id": "string",
+    "adopted": "boolean",
+    "reason": "未采纳原因（可选）"
+  }
+}
 ```
 
-示例输出：
+基于反馈数据计算的指标：
 
-```
-=== 过程指标（最近 30 天）===
-检索触发次数:     142
-检索命中率:       78%
-候选经验通过率:   61%
-active 经验总数:  23
+| 指标 | 说明 | 用途 |
+|------|------|------|
+| 经验采纳率 | adopted_count / hit_count | 判断经验是否相关 |
+| 低采纳率经验数 | 采纳率 < 30% 的经验数 | 识别需要归档的经验 |
+| 拒绝原因分布 | 统计未采纳的原因 | 优化提取质量 |
 
-=== 效果对比（最近 30 天）===
-              有经验注入    无注入
-平均对话轮数     3.2         5.7
-报错率           18%         41%
-用户接受率       84%         67%
-```
+---
 
 ### 1.6 Phase 1 交付物
 
 - extract_experience MCP tool（agent 自动提取入口）
-- search_best_practices MCP tool（检索注入入口）
+- search_best_practices MCP tool（检索入口）
 - record_session MCP tool（效果数据采集）
+- record_feedback MCP tool（反馈数据采集）
 - xp review CLI（人工确认）
 - xp import CLI（冷启动导入）
+- xp add CLI（交互式手动添加）
 - xp stats CLI（指标查看）
-- 本地向量存储 + SQLite 指标库
+- 本地 BM25 检索 + SQLite 指标库
 
 验证标准： 积累 30 次以上 session 后，xp stats 能输出有经验注入 vs 无注入的效果对比数据。
 
@@ -336,11 +350,45 @@ xp init --project "mobile-app" --tags "react-native,typescript"
 | 模块 | Phase 1 | Phase 2/3 |
 |------|---------|-----------|
 | 存储 | 本地 JSON | 云端数据库（Supabase / Weaviate / ES） |
-| 检索引擎 | BM25（纯文本） | BM25 / 混合检索（可选向量） |
-| Embedding | 无需 | 可选，语义搜索场景按需启用 |
+| 检索引擎 | BM25（纯文本） | BM25（纯文本，禁用向量） |
+| Embedding | 无需 | 无需（前后端均禁用） |
 | 指标存储 | 本地 SQLite | 云端（随知识库一起迁移） |
-| 入口 | MCP Server + CLI | 同左，增加 Web UI |
+| 入口 | MCP Server + CLI | 同左 |
 | 语言 | Python | 同左 |
+
+### 云端 Provider 配置
+
+#### Supabase (PostgreSQL)
+```bash
+# 环境变量
+XP_SUPABASE_URL=https://your-project.supabase.co
+XP_SUPABASE_KEY=your-service-key
+
+# 或使用 xp init
+xp init --project "myapp" --cloud-provider supabase --cloud-url "..." --cloud-key "..."
+```
+
+#### Weaviate Cloud
+```bash
+XP_WEAVIATE_URL=https://your-cluster.weaviate.network
+XP_WEAVIATE_API_KEY=your-api-key
+```
+
+#### Elasticsearch
+```bash
+XP_ES_HOST=https://your-cluster.es.io
+XP_ES_API_KEY=your-api-key
+# 或用户名/密码
+XP_ES_USERNAME=elastic
+XP_ES_PASSWORD=your-password
+```
+
+### 自定义存储目录
+
+```bash
+# 环境变量
+XP_HOME=/path/to/custom/dir xp review
+```
 
 ## 关键设计原则
 

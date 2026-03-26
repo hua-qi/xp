@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+from .file_watcher import TTLManager, FileWatcher, calculate_files_hashes
 from .models import (
     Experience,
     ExperienceLevel,
@@ -12,13 +13,171 @@ from .models import (
     Feedback,
     Session,
 )
+from .project_config import ProjectManager
 from .storage import ExperienceStore, MetricsStore, _extract_keywords
 
 
 class KnowledgeService:
-    def __init__(self, store: ExperienceStore, metrics: MetricsStore):
+    def __init__(self, store: ExperienceStore, metrics: MetricsStore, project: str = "default"):
         self._store = store
         self._metrics = metrics
+        self._project = project
+        self._project_manager = ProjectManager()
+        self._file_watcher = FileWatcher()
+        self._ttl_manager = TTLManager()
+
+    @property
+    def current_project(self) -> str:
+        return self._project
+
+    def set_project(self, project: str):
+        """切换当前项目"""
+        self._project = project
+
+    # Phase 3: 文件监听和失效检测
+    async def check_stale_experiences(self) -> list[tuple[Experience, list[str]]]:
+        """检查失效的经验
+
+        Returns:
+            [(经验, 变更文件列表), ...]
+        """
+        # 获取当前项目的 active 经验
+        all_active = self._store.list_active()
+        project_exps = [e for e in all_active if e.project == self._project]
+
+        # 运行文件监听检查
+        stale_list = self._file_watcher.run_check(project_exps)
+
+        # 更新经验状态
+        for exp, changed_files in stale_list:
+            exp.stale_reason = f"Files changed: {', '.join(changed_files)}"
+            self._store.update(exp)
+
+        return stale_list
+
+    async def mark_stale_resolved(self, exp_id: str) -> bool:
+        """标记失效经验为已解决"""
+        exp = self._store.get(exp_id)
+        if not exp or not exp.stale_reason:
+            return False
+
+        # 重新计算文件 hash
+        exp.file_hashes = calculate_files_hashes(exp.related_files)
+        exp.stale_reason = None
+        return self._store.update(exp)
+
+    # Phase 3: TTL 管理
+    async def run_ttl_check(self) -> list[Experience]:
+        """运行 TTL 检查，归档过期经验
+
+        Returns:
+            被归档的经验列表
+        """
+        # 获取当前项目的 active 经验
+        all_active = self._store.list_active()
+        project_exps = [e for e in all_active if e.project == self._project]
+
+        # 检查过期
+        expired = self._ttl_manager.check_experiences(project_exps)
+
+        # 归档过期经验
+        for exp in expired:
+            exp.status = ExperienceStatus.ARCHIVED
+            exp.reject_reason = f"TTL expired (90 days no hit)"
+            self._store.update(exp)
+
+        return expired
+
+    # Phase 3: 项目管理
+    def create_project(self, name: str, tags: list[str] = None, root_path: str = None) -> "ProjectConfig":
+        """创建新项目"""
+        from .project_config import ProjectConfig
+        config = self._project_manager.create(name, tags, root_path)
+        return config
+
+    def switch_project(self, name: str) -> bool:
+        """切换到指定项目"""
+        if name not in [p.name for p in self._project_manager.list()]:
+            return False
+        self._project_manager.set_current(name)
+        self._project = name
+        return True
+
+    def get_current_project_config(self) -> Optional["ProjectConfig"]:
+        """获取当前项目配置"""
+        return self._project_manager.get(self._project)
+
+    def list_projects(self) -> list["ProjectConfig"]:
+        """列出所有项目"""
+        return self._project_manager.list()
+
+    # Phase 3: 云端同步
+    async def enable_cloud_sync(self, provider: str, **config) -> bool:
+        """启用云端同步"""
+        from .cloud_providers import CloudSyncManager
+        sync_manager = CloudSyncManager()
+
+        if not await sync_manager.connect(provider, **config):
+            return False
+
+        # 更新项目配置
+        self._project_manager.enable_cloud_sync(self._project, provider, **config)
+        return True
+
+    async def sync_to_cloud(self) -> dict:
+        """同步本地经验到云端"""
+        from .cloud_providers import CloudSyncManager
+
+        config = self.get_current_project_config()
+        if not config or not config.cloud_sync_enabled:
+            return {"error": "Cloud sync not enabled"}
+
+        sync_manager = CloudSyncManager()
+        if not await sync_manager.connect(config.cloud_provider, **config.cloud_config):
+            return {"error": "Failed to connect to cloud"}
+
+        # 获取当前项目的所有经验
+        all_exps = []
+        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+            all_exps.extend(self._store.list_by_status(status))
+
+        project_exps = [e for e in all_exps if e.project == self._project]
+
+        result = await sync_manager.sync_upload_all(project_exps)
+        await sync_manager.disconnect()
+        return result
+
+    async def sync_from_cloud(self) -> dict:
+        """从云端同步经验到本地"""
+        from .cloud_providers import CloudSyncManager
+
+        config = self.get_current_project_config()
+        if not config or not config.cloud_sync_enabled:
+            return {"error": "Cloud sync not enabled", "count": 0}
+
+        sync_manager = CloudSyncManager()
+        if not await sync_manager.connect(config.cloud_provider, **config.cloud_config):
+            return {"error": "Failed to connect to cloud", "count": 0}
+
+        # 下载云端经验
+        cloud_exps = await sync_manager.sync_download_all(self._project)
+
+        # 合并到本地
+        merged = 0
+        new = 0
+        for exp in cloud_exps:
+            existing = self._store.get(exp.id)
+            if existing:
+                # 更新现有经验
+                self._store.update(exp)
+                merged += 1
+            else:
+                # 新增经验
+                self._store.add(exp)
+                new += 1
+
+        await sync_manager.disconnect()
+        return {"merged": merged, "new": new, "total": len(cloud_exps)}
 
     async def extract_experience(
         self,
@@ -40,9 +199,12 @@ class KnowledgeService:
 
         # 自动推断技术栈标签
         tech_stack = self._infer_tech_stack(all_text)
-        
+
         # 自动推断场景标签
         scene = self._infer_scene(all_text)
+
+        # Phase 3: 计算相关文件的 hash
+        file_hashes = calculate_files_hashes(related_files)
 
         exp = Experience(
             id=str(uuid.uuid4()),
@@ -63,6 +225,8 @@ class KnowledgeService:
                 scene=scene,
                 keywords=keywords,
             ),
+            file_hashes=file_hashes,
+            project=self._project,
         )
 
         return self._store.add(exp)
@@ -73,25 +237,84 @@ class KnowledgeService:
         tags: Optional[list[str]] = None,
         top_k: int = 3,
         threshold: float = 0.1,
+        cross_project: bool = False,
     ) -> list[Experience]:
         """
         纯文本标签 + BM25 检索
-        
+
         参数:
             query: 查询文本（任务描述或问题描述）
             tags: 技术栈标签过滤（可选）
             top_k: 返回条数
             threshold: BM25 分数阈值
+            cross_project: 是否跨项目检索
         """
-        results = self._store.search(
-            query=query,
-            tech_stack=tags,  # 向后兼容：tags 作为 tech_stack 过滤
-            top_k=top_k,
-            threshold=threshold,
-        )
+        # 获取所有 active 经验
+        candidates = self._store.list_active()
+
+        # Phase 3: 项目过滤
+        if not cross_project:
+            candidates = [e for e in candidates if e.project == self._project]
+
+        # Phase 3: 过滤已过期和已失效的经验
+        valid_candidates = []
+        for exp in candidates:
+            # 跳过 TTL 过期的
+            if self._ttl_manager.is_expired(exp.last_hit_at):
+                continue
+            # 跳过已标记为 stale 的
+            if exp.stale_reason:
+                continue
+            valid_candidates.append(exp)
+
+        # 执行 BM25 搜索
+        from .storage import _tokenize
+        from rank_bm25 import BM25Okapi
+
+        if not valid_candidates:
+            self._metrics.record_search(query, 0)
+            return []
+
+        # 标签过滤
+        if tags:
+            valid_candidates = [
+                exp for exp in valid_candidates
+                if any(t in exp.metadata.tech_stack for t in tags)
+            ]
+
+        if not valid_candidates:
+            self._metrics.record_search(query, 0)
+            return []
+
+        # BM25 排序
+        corpus = []
+        for exp in valid_candidates:
+            text = f"{exp.title}\n{exp.problem}\n{exp.solution}\n{' '.join(exp.metadata.keywords)}"
+            corpus.append(_tokenize(text))
+
+        bm25 = BM25Okapi(corpus)
+        query_tokens = _tokenize(query)
+        scores = bm25.get_scores(query_tokens)
+
+        # 组合结果
+        results = []
+        for exp, score in zip(valid_candidates, scores):
+            if score >= threshold:
+                exp.similarity = round(score, 3)
+                results.append((exp, score))
+
+        # 按分数排序
+        results.sort(key=lambda x: x[1], reverse=True)
+        results = results[:top_k]
+
+        # Phase 3: 更新最后使用时间
+        now = datetime.utcnow().isoformat()
+        for exp, _ in results:
+            exp.last_hit_at = now
+            self._store.update(exp)
 
         self._metrics.record_search(query, len(results))
-        return results
+        return [exp for exp, _ in results]
 
     async def record_session(self, session: Session):
         self._metrics.record_session(session)
