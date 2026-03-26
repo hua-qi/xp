@@ -9,7 +9,7 @@ from typing import Optional
 from .models import ProjectConfig
 
 
-XP_HOME = Path(os.environ.get("XP_HOME", Path.home() / ".xp"))
+XP_HOME = Path(os.environ.get("XP_HOME", "/Users/lianzimeng/workspace/xp-data"))
 PROJECT_CONFIG_FILE = XP_HOME / "projects.json"
 CURRENT_PROJECT_FILE = XP_HOME / "current_project"
 

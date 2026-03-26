@@ -20,7 +20,7 @@ from .models import (
     Session,
 )
 
-XP_HOME = Path(os.environ.get("XP_HOME", Path.home() / ".xp"))
+XP_HOME = Path(os.environ.get("XP_HOME", "/Users/lianzimeng/workspace/xp-data"))
 KNOWLEDGE_FILE = XP_HOME / "knowledge.json"
 METRICS_DB = XP_HOME / "metrics.db"
 
