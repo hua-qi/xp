@@ -80,6 +80,8 @@ class Session:
     had_error_correction: bool
     user_accepted: bool
     created_at: str
+    ab_test_group: str = "control"  # A/B 测试分组: "control" | "treatment"
+    ab_test_result_shown: bool = True  # 是否实际展示了经验结果
 
 
 @dataclass

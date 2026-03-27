@@ -94,6 +94,30 @@ def _init_metrics_schema(conn: sqlite3.Connection):
             last_adopted_at TEXT,
             adoption_rate REAL DEFAULT 0.0
         );
+
+        -- 检索策略 A/B 测试表：对比 BM25 vs Embedding vs Hybrid 的效果
+        CREATE TABLE IF NOT EXISTS search_strategy_ab_test (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            strategy TEXT NOT NULL,  -- 'bm25_only', 'embedding_only', 'hybrid'
+            result_count INTEGER NOT NULL,
+            experience_ids_returned TEXT,  -- JSON 数组
+            created_at TEXT NOT NULL
+        );
+
+        -- 检索策略效果指标表：记录每种策略的长期效果
+        CREATE TABLE IF NOT EXISTS search_strategy_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT NOT NULL,  -- 'bm25_only', 'embedding_only', 'hybrid'
+            total_searches INTEGER DEFAULT 0,
+            total_hits INTEGER DEFAULT 0,  -- 有结果返回的次数
+            total_adoptions INTEGER DEFAULT 0,  -- 经验被采纳的次数
+            hit_rate REAL DEFAULT 0.0,
+            adoption_rate REAL DEFAULT 0.0,
+            avg_result_count REAL DEFAULT 0.0,
+            updated_at TEXT NOT NULL
+        );
     """)
     conn.commit()
 
@@ -308,6 +332,76 @@ class MetricsStore:
                 "INSERT INTO search_events (query, result_count, created_at) VALUES (?, ?, ?)",
                 (query, result_count, datetime.utcnow().isoformat()),
             )
+
+    def record_search_strategy(
+        self,
+        session_id: str,
+        query: str,
+        strategy: str,  # 'bm25_only', 'embedding_only', 'hybrid'
+        result_count: int,
+        experience_ids: list[str],
+    ):
+        """记录检索策略 A/B 测试数据"""
+        with _get_metrics_conn() as conn:
+            conn.execute(
+                """INSERT INTO search_strategy_ab_test
+                   (session_id, query, strategy, result_count, experience_ids_returned, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, query, strategy, result_count, json.dumps(experience_ids), datetime.utcnow().isoformat()),
+            )
+
+    def update_search_strategy_metrics(self, strategy: str, had_result: bool, was_adopted: bool):
+        """更新检索策略的长期效果指标"""
+        with _get_metrics_conn() as conn:
+            conn.execute("""
+                INSERT INTO search_strategy_metrics
+                    (strategy, total_searches, total_hits, total_adoptions, updated_at)
+                VALUES (?, 1, ?, ?, ?)
+                ON CONFLICT(strategy) DO UPDATE SET
+                    total_searches = total_searches + 1,
+                    total_hits = total_hits + excluded.total_hits,
+                    total_adoptions = total_adoptions + excluded.total_adoptions,
+                    hit_rate = ROUND((total_hits + excluded.total_hits) * 1.0 / (total_searches + 1), 3),
+                    adoption_rate = ROUND(
+                        (total_adoptions + excluded.total_adoptions) * 1.0 / 
+                        NULLIF(total_hits + excluded.total_hits, 0), 3
+                    ),
+                    updated_at = excluded.updated_at
+            """, (strategy, 1 if had_result else 0, 1 if was_adopted else 0, datetime.utcnow().isoformat()))
+
+    def get_search_strategy_comparison(self, since_days: Optional[int] = None) -> dict:
+        """获取检索策略对比数据"""
+        conn = _get_metrics_conn()
+        date_filter = ""
+        params: list = []
+        if since_days:
+            cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+            date_filter = "WHERE created_at >= ?"
+            params = [cutoff]
+
+        # 获取各策略的检索次数和命中率
+        rows = conn.execute(f"""
+            SELECT
+                strategy,
+                COUNT(*) as total_searches,
+                SUM(CASE WHEN result_count > 0 THEN 1 ELSE 0 END) as hits,
+                AVG(result_count) as avg_results
+            FROM search_strategy_ab_test
+            {date_filter}
+            GROUP BY strategy
+        """, params).fetchall()
+
+        result = {}
+        for row in rows:
+            result[row["strategy"]] = {
+                "total_searches": row["total_searches"],
+                "hits": row["hits"],
+                "hit_rate": round(row["hits"] / row["total_searches"], 3) if row["total_searches"] else 0,
+                "avg_results": round(row["avg_results"], 2),
+            }
+
+        conn.close()
+        return result
 
     def record_review(self, experience_id: str, action: str, reject_reason: Optional[str] = None):
         with _get_metrics_conn() as conn:

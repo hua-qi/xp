@@ -52,6 +52,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "【必填】有什么坑要注意？这是最有价值的部分（如：'不要在 useEffect 里直接调用 setState，会导致无限循环'）",
                     },
+                    "conversation_summary": {
+                        "type": "string",
+                        "description": "【强烈推荐】对话过程摘要，包含关键排查步骤、尝试过的方案、报错信息等，帮助更完整理解问题背景",
+                    },
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -69,8 +73,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_best_practices",
             description=(
-                "【任务开始第一步】在开始任何任务前，先检索团队历史经验，避免重复踩坑！"
-                "检索内容包括：bugfix 方案、代码模式、配置技巧、最佳实践等。"
+                "【任务开始第一步】在执行任何任务前，先检索团队历史经验，避免重复踩坑！"
+                "适用任务：编写代码、生成文档、Debug 排查、代码重构、配置环境、代码审查、测试编写等。"
+                "检索内容：bugfix 方案、代码模式、配置技巧、文档模板、最佳实践等。"
                 "即使不确定是否有相关经验，也应该调用 - 零成本，高回报。"
                 "返回的经验会告诉你：'前人踩过什么坑'、'推荐怎么解决'、'要注意什么'。"
             ),
@@ -103,8 +108,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="record_session",
             description=(
-                "在一次完整的代码生成任务结束后调用，记录本次会话数据用于效果评估。"
-                "无论是否使用了经验注入，都应记录。"
+                "【任务完成后必调】在一次完整的任务结束后调用，记录本次会话数据用于效果评估。"
+                "适用任务：编写代码、生成文档、Debug 排查、代码重构、配置环境、代码审查、测试编写等任何任务。"
+                "无论是否使用了经验注入、无论成功与否，都应记录。"
             ),
             inputSchema={
                 "type": "object",
@@ -172,6 +178,33 @@ async def list_tools() -> list[Tool]:
                 "required": ["experience_id", "adopted"],
             },
         ),
+        Tool(
+            name="infer_adoption",
+            description=(
+                "【自动推断经验采纳情况】根据最终生成的内容和注入的经验，自动推断哪些经验被采纳了。"
+                "系统会检查最终回复是否包含经验中的关键代码、方案或决策点。"
+                "无需手动标记，自动完成反馈闭环！"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "会话 ID，与 record_session 中的一致",
+                    },
+                    "final_response": {
+                        "type": "string",
+                        "description": "任务的最终回复内容（代码、文档、分析结果等）",
+                    },
+                    "experience_ids_injected": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "本次注入的经验 ID 列表",
+                    },
+                },
+                "required": ["session_id", "final_response", "experience_ids_injected"],
+            },
+        ),
     ]
 
 
@@ -184,6 +217,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             task_description=arguments["task_description"],
             solution_summary=arguments["solution_summary"],
             key_decisions=arguments["key_decisions"],
+            conversation_summary=arguments.get("conversation_summary"),
             tags=arguments.get("tags", []),
             related_files=arguments.get("related_files", []),
         )
@@ -206,10 +240,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )]
 
     elif name == "search_best_practices":
-        results = await service.search(
+        results, meta = await service.search(
             query=arguments["query"],
             tags=arguments.get("tags"),
             top_k=arguments.get("top_k", 3),
+            session_id=arguments.get("session_id"),
         )
         if not results:
             return [TextContent(
@@ -279,7 +314,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 }, ensure_ascii=False),
             )]
 
-    return [TextContent(type="text", text=f"未知工具: {name}")]
+    elif name == "infer_adoption":
+        results = await service.infer_adoption(
+            session_id=arguments["session_id"],
+            final_response=arguments["final_response"],
+            experience_ids_injected=arguments["experience_ids_injected"],
+        )
+        return [TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "inferred",
+                "session_id": arguments["session_id"],
+                "results": results,
+                "message": f"已自动推断 {len(results)} 条经验的采纳情况，反馈已记录。",
+            }, ensure_ascii=False, indent=2),
+        )]
+
+    return [TextContent(type="text", text=f"未知工具: {name}")]}
 
 
 async def main():

@@ -184,6 +184,7 @@ class KnowledgeService:
         task_description: str,
         solution_summary: str,
         key_decisions: str,
+        conversation_summary: Optional[str] = None,
         tags: Optional[list[str]] = None,
         related_files: Optional[list[str]] = None,
     ) -> Experience:
@@ -193,8 +194,10 @@ class KnowledgeService:
         level = self._infer_level(task_description, key_decisions)
         exp_type = self._infer_type(task_description, key_decisions)
 
-        # 自动提取关键词
+        # 自动提取关键词（包含对话摘要以获取更多上下文）
         all_text = f"{task_description}\n{solution_summary}\n{key_decisions}"
+        if conversation_summary:
+            all_text = f"{all_text}\n{conversation_summary}"
         keywords = _extract_keywords(all_text)
 
         # 自动推断技术栈标签
@@ -238,9 +241,12 @@ class KnowledgeService:
         top_k: int = 3,
         threshold: float = 0.1,
         cross_project: bool = False,
-    ) -> list[Experience]:
+        session_id: Optional[str] = None,
+        enable_ab_test: bool = True,
+        enable_strategy_ab_test: bool = True,
+    ) -> tuple[list[Experience], dict]:
         """
-        纯文本标签 + BM25 检索
+        混合检索：BM25 + Embedding，支持 A/B 测试
 
         参数:
             query: 查询文本（任务描述或问题描述）
@@ -248,7 +254,23 @@ class KnowledgeService:
             top_k: 返回条数
             threshold: BM25 分数阈值
             cross_project: 是否跨项目检索
+            session_id: 会话 ID，用于 A/B 测试分组
+            enable_ab_test: 是否启用整体 A/B 测试（有经验 vs 无经验）
+            enable_strategy_ab_test: 是否启用检索策略 A/B 测试（BM25 vs Embedding）
+
+        Returns:
+            (经验列表, 元数据字典包含 ab_test_group, strategy)
         """
+        # A/B 测试分组1：10% 对照组（不展示经验），90% 实验组（正常展示）
+        ab_test_group = "treatment"
+        show_results = True
+        if enable_ab_test and session_id:
+            import hashlib
+            hash_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16)
+            if hash_val % 10 == 0:  # 10% 对照组
+                ab_test_group = "control"
+                show_results = False
+
         # 获取所有 active 经验
         candidates = self._store.list_active()
 
@@ -271,9 +293,14 @@ class KnowledgeService:
         from .storage import _tokenize
         from rank_bm25 import BM25Okapi
 
+        # A/B 测试：对照组直接返回空结果（但仍记录检索事件）
+        if not show_results:
+            self._metrics.record_search(query, 0)
+            return [], {"ab_test_group": ab_test_group, "show_results": False, "strategy": None}
+
         if not valid_candidates:
             self._metrics.record_search(query, 0)
-            return []
+            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": None}
 
         # 标签过滤
         if tags:
@@ -284,9 +311,19 @@ class KnowledgeService:
 
         if not valid_candidates:
             self._metrics.record_search(query, 0)
-            return []
+            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": None}
 
-        # BM25 排序
+        # A/B 测试分组2：检索策略对比（50% BM25, 50% Embedding）
+        strategy = "hybrid"  # 默认混合
+        if enable_strategy_ab_test and session_id:
+            import hashlib
+            hash_val = int(hashlib.md5((session_id + "_strategy").encode()).hexdigest(), 16)
+            if hash_val % 2 == 0:
+                strategy = "bm25_only"
+            else:
+                strategy = "embedding_only"
+
+        # BM25 排序（所有策略都需要先算 BM25 分数作为基础）
         corpus = []
         for exp in valid_candidates:
             text = f"{exp.title}\n{exp.problem}\n{exp.solution}\n{' '.join(exp.metadata.keywords)}"
@@ -296,16 +333,82 @@ class KnowledgeService:
         query_tokens = _tokenize(query)
         scores = bm25.get_scores(query_tokens)
 
-        # 组合结果
-        results = []
+        # 组合 BM25 结果
+        bm25_results = []
         for exp, score in zip(valid_candidates, scores):
             if score >= threshold:
                 exp.similarity = round(score, 3)
-                results.append((exp, score))
+                bm25_results.append((exp, score))
 
-        # 按分数排序
-        results.sort(key=lambda x: x[1], reverse=True)
-        results = results[:top_k]
+        # 如果 BM25 结果太少，直接返回
+        if len(bm25_results) < 2:
+            results = bm25_results[:top_k]
+            now = datetime.utcnow().isoformat()
+            for exp, _ in results:
+                exp.last_hit_at = now
+                self._store.update(exp)
+            self._metrics.record_search(query, len(results))
+            self._metrics.record_search_strategy(
+                session_id or "no_session", query, "bm25_only", len(results), [exp.id for exp, _ in results]
+            )
+            return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "bm25_only"}
+
+        results = []
+        
+        if strategy == "bm25_only":
+            # 仅使用 BM25 排序
+            bm25_results.sort(key=lambda x: x[1], reverse=True)
+            results = bm25_results[:top_k]
+            
+        elif strategy == "embedding_only":
+            # 仅使用 Embedding 排序
+            try:
+                from .embeddings import get_cache, cosine_similarity
+                cache = get_cache()
+                query_vec = cache.get_or_compute(query)
+                
+                candidate_texts = [f"{exp.title}\n{exp.problem}\n{exp.solution}" for exp, _ in bm25_results]
+                doc_vecs = cache.get_or_compute_batch(candidate_texts)
+                semantic_scores = cosine_similarity(query_vec, doc_vecs)
+                
+                embedding_results = []
+                for i, (exp, _) in enumerate(bm25_results):
+                    embedding_results.append((exp, semantic_scores[i]))
+                embedding_results.sort(key=lambda x: x[1], reverse=True)
+                results = embedding_results[:top_k]
+            except Exception:
+                # Embedding 失败时回退到 BM25
+                bm25_results.sort(key=lambda x: x[1], reverse=True)
+                results = bm25_results[:top_k]
+                strategy = "bm25_only"
+                
+        else:  # hybrid
+            # 混合排序：BM25 + Embedding
+            try:
+                from .embeddings import get_cache, cosine_similarity
+                cache = get_cache()
+                query_vec = cache.get_or_compute(query)
+                
+                candidate_texts = [f"{exp.title}\n{exp.problem}\n{exp.solution}" for exp, _ in bm25_results]
+                doc_vecs = cache.get_or_compute_batch(candidate_texts)
+                semantic_scores = cosine_similarity(query_vec, doc_vecs)
+                
+                max_bm25 = max(score for _, score in bm25_results)
+                min_bm25 = min(score for _, score in bm25_results)
+                bm25_range = max_bm25 - min_bm25 if max_bm25 > min_bm25 else 1
+                
+                hybrid_results = []
+                for i, (exp, bm25_score) in enumerate(bm25_results):
+                    bm25_norm = (bm25_score - min_bm25) / bm25_range
+                    hybrid_score = 0.7 * bm25_norm + 0.3 * semantic_scores[i]
+                    hybrid_results.append((exp, hybrid_score))
+                hybrid_results.sort(key=lambda x: x[1], reverse=True)
+                results = hybrid_results[:top_k]
+            except Exception:
+                # Embedding 失败时回退到纯 BM25
+                bm25_results.sort(key=lambda x: x[1], reverse=True)
+                results = bm25_results[:top_k]
+                strategy = "bm25_only"
 
         # Phase 3: 更新最后使用时间
         now = datetime.utcnow().isoformat()
@@ -313,11 +416,83 @@ class KnowledgeService:
             exp.last_hit_at = now
             self._store.update(exp)
 
+        # 记录检索策略 A/B 测试数据
+        experience_ids = [exp.id for exp, _ in results]
         self._metrics.record_search(query, len(results))
-        return [exp for exp, _ in results]
+        self._metrics.record_search_strategy(
+            session_id or "no_session", query, strategy, len(results), experience_ids
+        )
+
+        return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": strategy}
 
     async def record_session(self, session: Session):
         self._metrics.record_session(session)
+
+    async def infer_adoption(
+        self,
+        session_id: str,
+        final_response: str,
+        experience_ids_injected: list[str],
+    ) -> list[dict]:
+        """自动推断经验采纳情况
+        
+        通过检查最终回复是否包含经验中的关键代码、方案或决策点来判断采纳情况。
+        
+        Returns:
+            每条经验的采纳推断结果 [{experience_id, adopted, confidence, matched_keywords}, ...]
+        """
+        results = []
+        final_lower = final_response.lower()
+        
+        for exp_id in experience_ids_injected:
+            exp = self._store.get(exp_id)
+            if not exp:
+                continue
+            
+            # 提取经验中的关键内容
+            exp_content = f"{exp.title} {exp.problem} {exp.solution}"
+            exp_keywords = exp.metadata.keywords if exp.metadata.keywords else _extract_keywords(exp_content)
+            
+            # 匹配关键词
+            matched = []
+            for kw in exp_keywords:
+                if len(kw) > 2 and kw.lower() in final_lower:  # 过滤短词
+                    matched.append(kw)
+            
+            # 计算匹配率
+            match_rate = len(matched) / len(exp_keywords) if exp_keywords else 0
+            
+            # 推断逻辑
+            if match_rate >= 0.3:  # 30% 以上关键词匹配
+                adopted = True
+                confidence = min(match_rate * 2, 0.95)  # 最高 0.95
+            elif match_rate >= 0.1:  # 10-30% 可能采纳
+                adopted = True
+                confidence = match_rate
+            else:
+                adopted = False
+                confidence = 1 - match_rate
+            
+            # 记录反馈
+            await self.record_feedback(exp_id, adopted, reason=f"Auto inferred: {match_rate:.1%} keywords matched")
+            
+            # 更新检索策略效果指标（通过 session_id 关联到检索策略）
+            # 这里简化处理：如果有采纳，认为所有策略都受益
+            # 实际应该通过 session 记录查询具体策略
+            if adopted and match_rate >= 0.3:
+                self._metrics.update_search_strategy_metrics("hybrid", True, True)
+                self._metrics.update_search_strategy_metrics("bm25_only", True, True)
+                self._metrics.update_search_strategy_metrics("embedding_only", True, True)
+            
+            results.append({
+                "experience_id": exp_id,
+                "adopted": adopted,
+                "confidence": round(confidence, 2),
+                "matched_keywords": matched[:5],  # 最多返回 5 个
+                "match_rate": round(match_rate, 2),
+            })
+        
+        return results
 
     def confirm_experience(self, exp_id: str) -> bool:
         exp = self._store.get(exp_id)
@@ -560,6 +735,10 @@ class KnowledgeService:
         process["pending_count"] = len(self.list_pending())
         return process
 
+    def get_search_strategy_comparison(self, since_days: Optional[int] = None) -> dict:
+        """获取检索策略对比数据"""
+        return self._metrics.get_search_strategy_comparison(since_days)
+
     def _infer_level(self, task: str, decisions: str) -> ExperienceLevel:
         text = (task + decisions).lower()
         if any(k in text for k in ["架构", "模式", "pattern", "设计", "architecture"]):
@@ -602,6 +781,7 @@ class KnowledgeService:
         """从文本中推断场景标签"""
         text_lower = text.lower()
         scene_keywords = {
+            # 前端 UI 场景
             "表单": ["表单", "form", "input", "validation", "校验"],
             "列表": ["列表", "list", "table", "grid", "pagination"],
             "异步": ["异步", "async", "await", "promise", "fetch", "api"],
@@ -610,6 +790,48 @@ class KnowledgeService:
             "性能优化": ["性能", "优化", "performance", "lazy", "cache", "memo"],
             "测试": ["测试", "test", "jest", "vitest", "cypress", "e2e"],
             "部署": ["部署", "deploy", "ci/cd", "pipeline", "build"],
+            "UI 组件": ["组件", "component", "ui", "界面", "布局", "layout"],
+            "样式": ["样式", "style", "css", "scss", "less", "tailwind", "styled"],
+            "弹窗/模态": ["弹窗", "模态", "modal", "dialog", "popup", "overlay"],
+            # CLI/终端场景
+            "CLI 工具": ["cli", "命令行", "command line", "终端", "terminal", "shell", "prompt"],
+            "快捷键": ["快捷键", "keybinding", "shortcut", "按键", "hotkey"],
+            "输入处理": ["输入", "input", "多行", "multiline", "换行", "enter"],
+            "跨平台": ["跨平台", "兼容", "windows", "linux", "macos", "mac", "跨终端"],
+            # 后端/基础设施场景
+            "数据库": ["数据库", "database", "sql", "query", "orm", "prisma"],
+            "API 设计": ["api", "接口", "endpoint", "rest", "graphql"],
+            "认证授权": ["认证", "授权", "auth", "login", "token", "jwt", "oauth"],
+            "错误处理": ["错误", "error", "exception", "catch", "try", "debug", "排查"],
+            "日志监控": ["日志", "log", "监控", "monitor", "trace", "metrics"],
+            "配置管理": ["配置", "config", "env", "environment", "variable", "设置"],
+            "文件操作": ["文件", "file", "目录", "folder", "path", "读写"],
+            # 工程化场景
+            "依赖管理": ["依赖", "dependency", "npm", "pip", "package", "install"],
+            "构建工具": ["构建", "build", "webpack", "vite", "rollup", "esbuild"],
+            "类型系统": ["类型", "type", "typescript", "typecheck", "interface"],
+            "代码规范": ["lint", "format", "prettier", "eslint", "规范", "风格"],
+            "版本控制": ["git", "版本", "commit", "merge", "branch", "rebase"],
+            # 文档编写场景
+            "API 文档": ["api 文档", "api doc", "swagger", "openapi", "接口文档"],
+            "README": ["readme", "项目介绍", "快速开始", "quick start"],
+            "技术文档": ["技术文档", "tech doc", "documentation", "wiki", "指南", "guide"],
+            "代码注释": ["注释", "comment", "docstring", "jsdoc", "typedoc"],
+            # 运维/基础设施场景
+            "容器化": ["docker", "容器", "container", "镜像", "image", "compose"],
+            "K8s": ["kubernetes", "k8s", "pod", "deployment", "service", "helm"],
+            "云服务": ["aws", "azure", "gcp", "阿里云", "腾讯云", "云服务器"],
+            "CI/CD": ["ci/cd", "jenkins", "github actions", "gitlab ci", "自动化部署"],
+            "监控告警": ["监控", "告警", "alert", "prometheus", "grafana", "sentry"],
+            # 数据分析场景
+            "数据处理": ["数据处理", "etl", "pipeline", "清洗", "transform"],
+            "数据分析": ["数据分析", "analysis", "pandas", "jupyter", "可视化"],
+            "算法模型": ["算法", "模型", "机器学习", "ml", "深度学习", "训练"],
+            # 通用场景
+            "环境配置": ["环境", "environment", "setup", "安装", "初始化", "配置"],
+            "权限管理": ["权限", "permission", "role", "rbac", "访问控制"],
+            "安全措施": ["安全", "security", "加密", "xss", "csrf", "注入", "漏洞"],
+            "性能调优": ["性能", "perf", "优化", "慢", "卡顿", "内存泄漏"],
         }
         
         found = []

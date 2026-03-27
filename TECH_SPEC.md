@@ -30,11 +30,14 @@ agent 开始任何任务
 
 目标： 打通"agent 自动提取候选 → 人工确认 → 检索注入"最小闭环，并记录核心指标供工具有效性判断
 
-**适用范围扩展**：不只是代码生成，任何通过 agent 完成的任务都适用：
-- 编码：bugfix、功能实现、代码模式
-- 运维：部署、配置、故障排查  
-- 数据分析：查询优化、可视化技巧
-- 文档：规范总结、模板提炼
+**适用范围**：XP 适用于 agent 执行任何任务时自动采用或沉淀最佳实践：
+- 编写代码：bugfix、功能实现、代码模式
+- 生成文档：API 文档、README、技术规范
+- Debug 排查：错误定位、问题诊断
+- 代码重构：重构、优化、迁移
+- 配置环境：Docker、CI/CD、依赖管理
+- 代码审查：Review PR/MR、代码评审
+- 测试编写：单元测试、集成测试、E2E 测试
 - 任何你觉得以后可能再遇到的情况
 
 ### 1.1 经验录入：agent 为主
@@ -46,7 +49,7 @@ MCP tool 定义：
 ```json
 {
   "name": "extract_experience",
-  "description": "在完成代码任务后，提取本次任务中值得沉淀的经验",
+  "description": "【任务完成后必做】在完成任务后，提取本次任务中值得沉淀的经验",
   "inputSchema": {
     "task_description": "本次任务描述",
     "solution_summary": "解决方案摘要",
@@ -128,7 +131,7 @@ xp import ./best-practices.md
 ```json
 {
   "name": "search_best_practices",
-  "description": "在开始编写代码前，根据当前任务描述检索历史最佳实践",
+  "description": "【任务开始第一步】在执行任何任务前，根据当前任务描述检索历史最佳实践",
   "inputSchema": {
     "type": "object",
     "properties": {

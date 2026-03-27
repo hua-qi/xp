@@ -194,6 +194,14 @@ def cmd_stats(args):
     print(f"  报错率            {w['error_rate'] * 100:<14.1f}{wo['error_rate'] * 100:.1f}%")
     print(f"  用户接受率        {w['accept_rate'] * 100:<14.1f}{wo['accept_rate'] * 100:.1f}%")
 
+    # 检索策略对比
+    strategy_stats = service.get_search_strategy_comparison(since_days)
+    if strategy_stats:
+        print(f"\n--- 检索策略对比 (A/B 测试) ---")
+        print(f"  策略            检索次数    命中次数    命中率    平均返回数")
+        for strategy, data in strategy_stats.items():
+            print(f"  {strategy:<14}  {data['total_searches']:<10}  {data['hits']:<10}  {data['hit_rate']*100:>5.1f}%  {data['avg_results']:.1f}")
+
     if stats["session_total"] < 10:
         print(f"\n  注意: 当前会话数较少（{stats['session_total']} 次），对比数据仅供参考，建议积累 30 次以上后再做判断。")
     print()
