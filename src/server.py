@@ -101,6 +101,10 @@ async def list_tools() -> list[Tool]:
                         "description": "是否跨项目检索（可选，默认 false）",
                         "default": False,
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "【强烈推荐】会话 ID，用于 A/B 测试分组和效果追踪（如 'session-20250327-001'）",
+                    },
                 },
                 "required": ["query"],
             },
@@ -139,6 +143,15 @@ async def list_tools() -> list[Tool]:
                     "user_accepted": {
                         "type": "boolean",
                         "description": "用户最终是否接受了生成的代码",
+                    },
+                    "ab_test_group": {
+                        "type": "string",
+                        "description": "A/B 测试分组，从 search_best_practices 返回的 metadata.ab_test_group 中获取，未调用则传 'treatment'",
+                    },
+                    "result_shown": {
+                        "type": "boolean",
+                        "description": "是否实际展示了经验结果，从 search_best_practices 返回值的 result_shown 字段获取，未调用则传 true",
+                        "default": True,
                     },
                 },
                 "required": [
@@ -229,11 +242,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "title": exp.title,
                 "type": exp.type.value,
                 "level": exp.level.value,
+                "key_decisions": exp.key_decisions,
                 "metadata": {
                     "tech_stack": exp.metadata.tech_stack,
                     "problem_type": exp.metadata.problem_type,
                     "scene": exp.metadata.scene,
-                    "keywords": exp.metadata.keywords,
+                    "keywords": [],
                 },
                 "message": "经验已提取，等待人工 review。运行 `xp review` 查看并确认。",
             }, ensure_ascii=False, indent=2),
@@ -249,7 +263,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if not results:
             return [TextContent(
                 type="text",
-                text="暂无相关历史经验，请根据实际情况处理。",
+                text=json.dumps({"ab_test_group": meta.get("ab_test_group", "treatment"), "result_shown": False, "results": [], "message": "暂无相关历史经验，请根据实际情况处理。"}, ensure_ascii=False),
             )]
         data = [
             {
@@ -265,13 +279,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     "tech_stack": exp.metadata.tech_stack,
                     "problem_type": exp.metadata.problem_type,
                     "scene": exp.metadata.scene,
-                    "keywords": exp.metadata.keywords,
+                    "keywords": [],
                 },
                 "note": "以上为历史经验，仅供参考，请结合当前实际情况判断是否适用。",
             }
             for exp in results
         ]
-        return [TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2))]
+        return [TextContent(type="text", text=json.dumps({"ab_test_group": meta.get("ab_test_group", "treatment"), "result_shown": bool(meta.get("show_results", True)), "results": data}, ensure_ascii=False, indent=2))]
 
     elif name == "record_session":
         session = Session(
@@ -282,6 +296,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             had_error_correction=arguments["had_error_correction"],
             user_accepted=arguments["user_accepted"],
             created_at=datetime.utcnow().isoformat(),
+            ab_test_group=arguments.get("ab_test_group", "treatment"),
+            ab_test_result_shown=arguments.get("result_shown", True),
         )
         await service.record_session(session)
         return [TextContent(
@@ -330,7 +346,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }, ensure_ascii=False, indent=2),
         )]
 
-    return [TextContent(type="text", text=f"未知工具: {name}")]}
+    return [TextContent(type="text", text=f"未知工具: {name}")]
 
 
 async def main():

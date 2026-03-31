@@ -14,7 +14,7 @@ from .models import (
     Session,
 )
 from .project_config import ProjectManager
-from .storage import ExperienceStore, MetricsStore, _extract_keywords
+from .storage import ExperienceStore, MetricsStore, VectorStore
 
 
 class KnowledgeService:
@@ -191,14 +191,26 @@ class KnowledgeService:
         tags = tags or []
         related_files = related_files or []
 
+        if not key_decisions or len(key_decisions.strip()) < 10:
+            raise ValueError(
+                "key_decisions 不能为空且长度不得少于 10 字。"
+                "请补充关键决策/踩坑点后重试。"
+            )
+        if not solution_summary or len(solution_summary.strip()) < 20:
+            raise ValueError(
+                "solution_summary 长度不得少于 20 字。"
+                "请补充解决方案摘要后重试。"
+            )
+
+        await self._check_duplicate(task_description, solution_summary)
+
         level = self._infer_level(task_description, key_decisions)
         exp_type = self._infer_type(task_description, key_decisions)
 
-        # 自动提取关键词（包含对话摘要以获取更多上下文）
+        # 取消关键词提取，使用纯向量
         all_text = f"{task_description}\n{solution_summary}\n{key_decisions}"
         if conversation_summary:
             all_text = f"{all_text}\n{conversation_summary}"
-        keywords = _extract_keywords(all_text)
 
         # 自动推断技术栈标签
         tech_stack = self._infer_tech_stack(all_text)
@@ -209,59 +221,74 @@ class KnowledgeService:
         # Phase 3: 计算相关文件的 hash
         file_hashes = calculate_files_hashes(related_files)
 
+        try:
+            title = await self._llm_generate_title(task_description)
+        except Exception:
+            title = self._make_title(task_description)
+
         exp = Experience(
             id=str(uuid.uuid4()),
             type=exp_type,
             level=level,
-            title=self._make_title(task_description),
+            title=title,
             tags=tags,  # 向后兼容
             problem=task_description,
-            solution=f"{solution_summary}\n\n关键决策：{key_decisions}",
+            solution=solution_summary,
+            key_decisions=key_decisions,
             confidence=0.6,
             status=ExperienceStatus.PENDING,
             source=ExperienceSource.AGENT,
             created_at=datetime.utcnow().isoformat(),
             related_files=related_files,
             metadata=ExperienceMetadata(
-                tech_stack=tech_stack if tech_stack else tags,  # 优先使用推断的技术栈
+                tech_stack=tech_stack if tech_stack else tags,
                 problem_type=exp_type.value,
                 scene=scene,
-                keywords=keywords,
             ),
             file_hashes=file_hashes,
             project=self._project,
         )
 
-        return self._store.add(exp)
+
+        exp = self._store.add(exp)
+        
+        # Phase 4: 生成向量并保存
+        from .embeddings import get_provider
+        from .storage import VectorStore
+        provider = get_provider()
+        exp_text = f"{exp.title}\n{exp.problem}\n{exp.key_decisions}"
+        vec = provider.embed_text(exp_text)
+        VectorStore().save_vector(exp.id, vec)
+        
+        return exp
 
     async def search(
         self,
         query: str,
         tags: Optional[list[str]] = None,
         top_k: int = 3,
-        threshold: float = 0.1,
+        threshold: float = 0.5,
         cross_project: bool = False,
         session_id: Optional[str] = None,
         enable_ab_test: bool = True,
         enable_strategy_ab_test: bool = True,
     ) -> tuple[list[Experience], dict]:
         """
-        混合检索：BM25 + Embedding，支持 A/B 测试
+        纯向量检索
 
         参数:
             query: 查询文本（任务描述或问题描述）
             tags: 技术栈标签过滤（可选）
             top_k: 返回条数
-            threshold: BM25 分数阈值
+            threshold: 余弦相似度阈值
             cross_project: 是否跨项目检索
             session_id: 会话 ID，用于 A/B 测试分组
             enable_ab_test: 是否启用整体 A/B 测试（有经验 vs 无经验）
-            enable_strategy_ab_test: 是否启用检索策略 A/B 测试（BM25 vs Embedding）
+            enable_strategy_ab_test: 兼容保留，实际只走 embedding_only
 
         Returns:
             (经验列表, 元数据字典包含 ab_test_group, strategy)
         """
-        # A/B 测试分组1：10% 对照组（不展示经验），90% 实验组（正常展示）
         ab_test_group = "treatment"
         show_results = True
         if enable_ab_test and session_id:
@@ -271,159 +298,69 @@ class KnowledgeService:
                 ab_test_group = "control"
                 show_results = False
 
-        # 获取所有 active 经验
         candidates = self._store.list_active()
-
-        # Phase 3: 项目过滤
         if not cross_project:
             candidates = [e for e in candidates if e.project == self._project]
 
-        # Phase 3: 过滤已过期和已失效的经验
         valid_candidates = []
         for exp in candidates:
-            # 跳过 TTL 过期的
             if self._ttl_manager.is_expired(exp.last_hit_at):
                 continue
-            # 跳过已标记为 stale 的
             if exp.stale_reason:
+                continue
+            if tags and not any(t in exp.metadata.tech_stack for t in tags):
                 continue
             valid_candidates.append(exp)
 
-        # 执行 BM25 搜索
-        from .storage import _tokenize
-        from rank_bm25 import BM25Okapi
-
-        # A/B 测试：对照组直接返回空结果（但仍记录检索事件）
-        if not show_results:
+        if not show_results or not valid_candidates:
             self._metrics.record_search(query, 0)
-            return [], {"ab_test_group": ab_test_group, "show_results": False, "strategy": None}
+            return [], {"ab_test_group": ab_test_group, "show_results": show_results, "strategy": "embedding_only"}
 
-        if not valid_candidates:
-            self._metrics.record_search(query, 0)
-            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": None}
+        from .embeddings import get_provider, cosine_similarity
+        from .storage import VectorStore
+        import numpy as np
 
-        # 标签过滤
-        if tags:
-            valid_candidates = [
-                exp for exp in valid_candidates
-                if any(t in exp.metadata.tech_stack for t in tags)
-            ]
+        provider = get_provider()
+        query_vec = np.array(provider.embed_text(query), dtype=np.float32)
 
-        if not valid_candidates:
-            self._metrics.record_search(query, 0)
-            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": None}
-
-        # A/B 测试分组2：检索策略对比（50% BM25, 50% Embedding）
-        strategy = "hybrid"  # 默认混合
-        if enable_strategy_ab_test and session_id:
-            import hashlib
-            hash_val = int(hashlib.md5((session_id + "_strategy").encode()).hexdigest(), 16)
-            if hash_val % 2 == 0:
-                strategy = "bm25_only"
-            else:
-                strategy = "embedding_only"
-
-        # BM25 排序（所有策略都需要先算 BM25 分数作为基础）
-        corpus = []
-        for exp in valid_candidates:
-            text = f"{exp.title}\n{exp.problem}\n{exp.solution}\n{' '.join(exp.metadata.keywords)}"
-            corpus.append(_tokenize(text))
-
-        bm25 = BM25Okapi(corpus)
-        query_tokens = _tokenize(query)
-        scores = bm25.get_scores(query_tokens)
-
-        # 组合 BM25 结果
-        bm25_results = []
-        for exp, score in zip(valid_candidates, scores):
-            if score >= threshold:
-                exp.similarity = round(score, 3)
-                bm25_results.append((exp, score))
-
-        # 如果 BM25 结果太少，直接返回
-        if len(bm25_results) < 2:
-            results = bm25_results[:top_k]
-            now = datetime.utcnow().isoformat()
-            for exp, _ in results:
-                exp.last_hit_at = now
-                self._store.update(exp)
-            self._metrics.record_search(query, len(results))
-            self._metrics.record_search_strategy(
-                session_id or "no_session", query, "bm25_only", len(results), [exp.id for exp, _ in results]
-            )
-            return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "bm25_only"}
-
-        results = []
+        v_store = VectorStore()
+        candidate_ids = [e.id for e in valid_candidates]
+        ids, vecs = v_store.get_all_vectors(candidate_ids)
         
-        if strategy == "bm25_only":
-            # 仅使用 BM25 排序
-            bm25_results.sort(key=lambda x: x[1], reverse=True)
-            results = bm25_results[:top_k]
-            
-        elif strategy == "embedding_only":
-            # 仅使用 Embedding 排序
-            try:
-                from .embeddings import get_cache, cosine_similarity
-                cache = get_cache()
-                query_vec = cache.get_or_compute(query)
-                
-                candidate_texts = [f"{exp.title}\n{exp.problem}\n{exp.solution}" for exp, _ in bm25_results]
-                doc_vecs = cache.get_or_compute_batch(candidate_texts)
-                semantic_scores = cosine_similarity(query_vec, doc_vecs)
-                
-                embedding_results = []
-                for i, (exp, _) in enumerate(bm25_results):
-                    embedding_results.append((exp, semantic_scores[i]))
-                embedding_results.sort(key=lambda x: x[1], reverse=True)
-                results = embedding_results[:top_k]
-            except Exception:
-                # Embedding 失败时回退到 BM25
-                bm25_results.sort(key=lambda x: x[1], reverse=True)
-                results = bm25_results[:top_k]
-                strategy = "bm25_only"
-                
-        else:  # hybrid
-            # 混合排序：BM25 + Embedding
-            try:
-                from .embeddings import get_cache, cosine_similarity
-                cache = get_cache()
-                query_vec = cache.get_or_compute(query)
-                
-                candidate_texts = [f"{exp.title}\n{exp.problem}\n{exp.solution}" for exp, _ in bm25_results]
-                doc_vecs = cache.get_or_compute_batch(candidate_texts)
-                semantic_scores = cosine_similarity(query_vec, doc_vecs)
-                
-                max_bm25 = max(score for _, score in bm25_results)
-                min_bm25 = min(score for _, score in bm25_results)
-                bm25_range = max_bm25 - min_bm25 if max_bm25 > min_bm25 else 1
-                
-                hybrid_results = []
-                for i, (exp, bm25_score) in enumerate(bm25_results):
-                    bm25_norm = (bm25_score - min_bm25) / bm25_range
-                    hybrid_score = 0.7 * bm25_norm + 0.3 * semantic_scores[i]
-                    hybrid_results.append((exp, hybrid_score))
-                hybrid_results.sort(key=lambda x: x[1], reverse=True)
-                results = hybrid_results[:top_k]
-            except Exception:
-                # Embedding 失败时回退到纯 BM25
-                bm25_results.sort(key=lambda x: x[1], reverse=True)
-                results = bm25_results[:top_k]
-                strategy = "bm25_only"
+        # 补全缺失的向量
+        missing_exps = [e for e in valid_candidates if e.id not in ids]
+        if missing_exps:
+            missing_texts = [f"{e.title}\n{e.problem}\n{e.key_decisions}" for e in missing_exps]
+            missing_vecs = provider.embed_texts(missing_texts)
+            v_store.save_vectors(list(zip([e.id for e in missing_exps], missing_vecs)))
+            # 重新获取
+            ids, vecs = v_store.get_all_vectors(candidate_ids)
 
-        # Phase 3: 更新最后使用时间
+        if len(vecs) == 0:
+            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "embedding_only"}
+
+        scores = cosine_similarity(query_vec, vecs)
+        
+        results = []
+        id_to_exp = {e.id: e for e in valid_candidates}
+        for exp_id, score in zip(ids, scores):
+            if score >= threshold:
+                exp = id_to_exp[exp_id]
+                exp.similarity = round(float(score), 3)
+                results.append((exp, score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        results = results[:top_k]
+
         now = datetime.utcnow().isoformat()
         for exp, _ in results:
             exp.last_hit_at = now
             self._store.update(exp)
 
-        # 记录检索策略 A/B 测试数据
         experience_ids = [exp.id for exp, _ in results]
         self._metrics.record_search(query, len(results))
-        self._metrics.record_search_strategy(
-            session_id or "no_session", query, strategy, len(results), experience_ids
-        )
 
-        return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": strategy}
+        return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "embedding_only"}
 
     async def record_session(self, session: Session):
         self._metrics.record_session(session)
@@ -436,60 +373,64 @@ class KnowledgeService:
     ) -> list[dict]:
         """自动推断经验采纳情况
         
-        通过检查最终回复是否包含经验中的关键代码、方案或决策点来判断采纳情况。
-        
-        Returns:
-            每条经验的采纳推断结果 [{experience_id, adopted, confidence, matched_keywords}, ...]
+        通过计算 final_response 与经验文本的向量余弦相似度进行推断
         """
+        if not experience_ids_injected:
+            return []
+
+        from .embeddings import get_provider, cosine_similarity
+        from .storage import VectorStore
+        import numpy as np
+
+        provider = get_provider()
+        v_resp = np.array(provider.embed_text(final_response), dtype=np.float32)
+
+        v_store = VectorStore()
+        ids, vecs = v_store.get_all_vectors(experience_ids_injected)
+
+        # 补全可能缺失的向量
+        missing_ids = [eid for eid in experience_ids_injected if eid not in ids]
+        if missing_ids:
+            missing_exps = []
+            for eid in missing_ids:
+                exp = self._store.get(eid)
+                if exp:
+                    missing_exps.append(exp)
+            if missing_exps:
+                missing_texts = [f"{e.title}\n{e.problem}\n{e.key_decisions}" for e in missing_exps]
+                missing_vecs = provider.embed_texts(missing_texts)
+                v_store.save_vectors(list(zip([e.id for e in missing_exps], missing_vecs)))
+                # 重新获取
+                ids, vecs = v_store.get_all_vectors(experience_ids_injected)
+
+        if len(vecs) == 0:
+            return []
+
+        scores = cosine_similarity(v_resp, vecs)
+
         results = []
-        final_lower = final_response.lower()
-        
-        for exp_id in experience_ids_injected:
-            exp = self._store.get(exp_id)
-            if not exp:
-                continue
-            
-            # 提取经验中的关键内容
-            exp_content = f"{exp.title} {exp.problem} {exp.solution}"
-            exp_keywords = exp.metadata.keywords if exp.metadata.keywords else _extract_keywords(exp_content)
-            
-            # 匹配关键词
-            matched = []
-            for kw in exp_keywords:
-                if len(kw) > 2 and kw.lower() in final_lower:  # 过滤短词
-                    matched.append(kw)
-            
-            # 计算匹配率
-            match_rate = len(matched) / len(exp_keywords) if exp_keywords else 0
-            
-            # 推断逻辑
-            if match_rate >= 0.3:  # 30% 以上关键词匹配
+        for exp_id, score in zip(ids, scores):
+            score_float = float(score)
+            if score_float >= 0.75:
                 adopted = True
-                confidence = min(match_rate * 2, 0.95)  # 最高 0.95
-            elif match_rate >= 0.1:  # 10-30% 可能采纳
+                confidence = score_float
+            elif score_float >= 0.60:
                 adopted = True
-                confidence = match_rate
+                confidence = score_float
             else:
                 adopted = False
-                confidence = 1 - match_rate
+                confidence = 1 - score_float
             
-            # 记录反馈
-            await self.record_feedback(exp_id, adopted, reason=f"Auto inferred: {match_rate:.1%} keywords matched")
+            await self.record_feedback(exp_id, adopted, reason=f"Auto inferred: {score_float:.2f} cosine similarity")
             
-            # 更新检索策略效果指标（通过 session_id 关联到检索策略）
-            # 这里简化处理：如果有采纳，认为所有策略都受益
-            # 实际应该通过 session 记录查询具体策略
-            if adopted and match_rate >= 0.3:
-                self._metrics.update_search_strategy_metrics("hybrid", True, True)
-                self._metrics.update_search_strategy_metrics("bm25_only", True, True)
-                self._metrics.update_search_strategy_metrics("embedding_only", True, True)
+
             
             results.append({
                 "experience_id": exp_id,
                 "adopted": adopted,
                 "confidence": round(confidence, 2),
-                "matched_keywords": matched[:5],  # 最多返回 5 个
-                "match_rate": round(match_rate, 2),
+                "matched_keywords": [],  # 兼容旧字段
+                "match_rate": round(score_float, 2),
             })
         
         return results
@@ -539,11 +480,15 @@ class KnowledgeService:
         exp.status = ExperienceStatus.ACTIVE
         exp.confidence = 1.0
 
-        # 重新提取关键词
-        all_text = f"{exp.title}\n{exp.problem}\n{exp.solution}"
-        exp.metadata.keywords = _extract_keywords(all_text)
-
+        # 重新生成向量
         self._store.update(exp)
+        
+        from .embeddings import get_provider
+        from .storage import VectorStore
+        provider = get_provider()
+        exp_text = f"{exp.title}\n{exp.problem}\n{exp.key_decisions}"
+        vec = provider.embed_text(exp_text)
+        VectorStore().save_vector(exp.id, vec)
         self._metrics.record_review(exp_id, "confirmed")
         return True
 
@@ -669,16 +614,24 @@ class KnowledgeService:
                 "type": "extraction_quality",
                 "issue": "提取的经验采纳率偏低",
                 "suggestion": "优化 extract_experience 的 prompt，让 agent 更准确地判断什么值得提取",
-                "data": f"总反馈 {feedback_summary['total_feedback']}, 采纳率 {feedback_summary['adoption_rate']*100:.1f}%"
+                "data": f"总反馈 {feedback_summary['total_feedback']}, 采纳率 {feedback_summary['adoption_rate']*100:.1f}%",
+                "actions": [],
             })
 
         # 2. 低采纳率经验过多
         if feedback_summary["low_adoption_count"] > 0:
+            low_ids = feedback_summary["low_adoption_ids"]
+            actions = []
+            for eid in low_ids[:5]:
+                short = eid[:8]
+                actions.append(f"xp archive {short}  # 归档")
+                actions.append(f"xp edit {short}     # 编辑优化后重新激活")
             low_quality_patterns.append({
                 "type": "low_adoption",
                 "issue": f"有 {feedback_summary['low_adoption_count']} 条经验采纳率低于 30%",
-                "suggestion": "考虑归档这些经验或检查是否与当前代码库脱节",
-                "data": f"经验 ID: {', '.join(feedback_summary['low_adoption_ids'][:5])}"
+                "suggestion": "以下经验长期未被采纳，建议归档或重新编辑",
+                "data": f"经验 ID: {', '.join(low_ids[:5])}",
+                "actions": actions,
             })
 
         # 3. 常见的拒绝原因
@@ -688,7 +641,87 @@ class KnowledgeService:
                 "type": "reject_pattern",
                 "issue": f"最常见的拒绝原因: '{top_reason[0]}' ({top_reason[1]} 次)",
                 "suggestion": "针对性优化提取逻辑",
-                "data": dict(feedback_summary["reject_reasons"])
+                "data": dict(feedback_summary["reject_reasons"]),
+                "actions": [],
+            })
+
+        # 4. 90 天未命中的 Active 经验
+        from datetime import timedelta
+        cutoff_90 = (datetime.utcnow() - timedelta(days=90)).isoformat()
+        stale_exps = [
+            e for e in all_exps
+            if e.status == ExperienceStatus.ACTIVE
+            and (e.last_hit_at is None or e.last_hit_at < cutoff_90)
+        ]
+        if stale_exps:
+            actions = []
+            for e in stale_exps[:5]:
+                short = e.id[:8]
+                actions.append(f"xp archive {short}  # 90天未命中，归档")
+            low_quality_patterns.append({
+                "type": "staleness",
+                "issue": f"有 {len(stale_exps)} 条 Active 经验超过 90 天未被检索",
+                "suggestion": f"最近一次命中时间最早的：{stale_exps[0].last_hit_at or '从未命中'}",
+                "data": f"经验 ID: {', '.join(e.id[:8] for e in stale_exps[:5])}",
+                "actions": actions,
+            })
+
+        # 5. 有 query 但 0 结果的搜索
+        miss_queries = self._metrics.get_search_miss_queries(since_days=30)
+        if miss_queries:
+            top_queries = [f'"{q["query"]}" ({q["count"]} 次)' for q in miss_queries[:5]]
+            low_quality_patterns.append({
+                "type": "search_miss",
+                "issue": f"近 30 天有 {len(miss_queries)} 个 query 未检索到任何经验",
+                "suggestion": "以下 query 对应的知识空白，建议补充相关经验",
+                "data": "；".join(top_queries),
+                "actions": ["xp add  # 补充新经验"],
+            })
+
+        # 6. 高相似度经验对（重复检测）
+        active_exps = [e for e in all_exps if e.status == ExperienceStatus.ACTIVE]
+        if len(active_exps) >= 2:
+            from .embeddings import cosine_similarity
+            v_store = VectorStore()
+            active_ids = [e.id for e in active_exps[:200]]
+            ids, vecs = v_store.get_all_vectors(active_ids)
+            duplicates = []
+            if len(ids) >= 2:
+                for i in range(len(ids)):
+                    for j in range(i + 1, len(ids)):
+                        sim = float(cosine_similarity(vecs[i], vecs[j:j+1])[0])
+                        if sim >= 0.92:
+                            duplicates.append((ids[i], ids[j], sim))
+            if duplicates:
+                actions = []
+                seen: set[str] = set()
+                for id_a, id_b, sim in duplicates[:5]:
+                    if id_b not in seen:
+                        actions.append(f"xp delete {id_b[:8]}  # 与 {id_a[:8]} 相似度 {sim:.2f}，建议删除")
+                        seen.add(id_b)
+                low_quality_patterns.append({
+                    "type": "duplicate_cluster",
+                    "issue": f"发现 {len(duplicates)} 对经验余弦相似度 >= 0.92",
+                    "suggestion": "高度相似的经验建议合并或删除冗余项",
+                    "data": f"共 {len(duplicates)} 对重复",
+                    "actions": actions,
+                })
+
+        # 7. coverage_gap：高频搜索词在知识库中无对应经验
+        recent_keywords = self._metrics.get_recent_query_keywords(since_days=30)
+        all_exp_tags: set[str] = set()
+        for e in all_exps:
+            if e.status == ExperienceStatus.ACTIVE:
+                all_exp_tags.update(e.tags)
+                all_exp_tags.update(e.metadata.tech_stack)
+        gap_keywords = [kw for kw in recent_keywords if kw not in all_exp_tags]
+        if gap_keywords:
+            low_quality_patterns.append({
+                "type": "coverage_gap",
+                "issue": f"近 30 天有 {len(gap_keywords)} 个高频搜索词在知识库中无对应经验",
+                "suggestion": "以下关键词对应知识空白，建议在下次遇到相关问题时主动提取经验",
+                "data": "空白关键词: " + "、".join(gap_keywords[:8]),
+                "actions": ["xp add  # 补充新经验"],
             })
 
         return {
@@ -713,7 +746,6 @@ class KnowledgeService:
             "recommendations": [
                 "定期运行 xp analyze 检查经验质量" if len(low_quality_patterns) > 0 else "当前经验质量良好",
                 f"关注 {feedback_summary['low_adoption_count']} 条低采纳率经验" if feedback_summary["low_adoption_count"] > 0 else "",
-                "考虑优化提取 prompt" if feedback_summary["adoption_rate"] < 0.6 else "",
             ]
         }
 
@@ -729,15 +761,88 @@ class KnowledgeService:
     def list_pending(self) -> list[Experience]:
         return self._store.list_by_status(ExperienceStatus.PENDING)
 
+    def archive_experience(self, prefix: str) -> Optional[Experience]:
+        all_exps = []
+        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+            all_exps.extend(self._store.list_by_status(status))
+        matches = [e for e in all_exps if e.id.startswith(prefix)]
+        if len(matches) != 1:
+            return None
+        exp = matches[0]
+        exp.status = ExperienceStatus.ARCHIVED
+        self._store.update(exp)
+        return exp
+
+    def delete_experience(self, prefix: str) -> Optional[str]:
+        all_exps = []
+        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+            all_exps.extend(self._store.list_by_status(status))
+        matches = [e for e in all_exps if e.id.startswith(prefix)]
+        if len(matches) != 1:
+            return None
+        exp = matches[0]
+        self._store.delete(exp.id)
+        return exp.id
+
     def get_stats(self, since_days: Optional[int] = None) -> dict:
         process = self._metrics.get_stats(since_days)
-        process["active_count"] = len(self._store.list_active())
+        all_active = self._store.list_active()
+        process["active_count"] = len(all_active)
         process["pending_count"] = len(self.list_pending())
+
+        archived_exps = self._store.list_by_status(ExperienceStatus.ARCHIVED)
+        process["archived_count"] = len(archived_exps)
+
+        type_dist = {}
+        for exp in all_active:
+            t = exp.type.value
+            type_dist[t] = type_dist.get(t, 0) + 1
+        process["type_distribution"] = type_dist
+
+        if all_active:
+            process["avg_confidence"] = round(
+                sum(e.confidence for e in all_active) / len(all_active), 3
+            )
+        else:
+            process["avg_confidence"] = 0.0
+
+        from .storage import _get_metrics_conn
+        conn = _get_metrics_conn()
+        hitted_ids = set(
+            r["experience_id"]
+            for r in conn.execute("SELECT experience_id FROM experience_stats WHERE hit_count > 0").fetchall()
+        )
+        conn.close()
+        process["zombie_count"] = sum(1 for e in all_active if e.id not in hitted_ids)
+
+        top_adopted_raw = process.get("top_adopted_experiences", [])
+        enriched = []
+        for item in top_adopted_raw:
+            exp = self._store.get(item["experience_id"])
+            enriched.append({
+                **item,
+                "title": exp.title[:30] if exp else item["experience_id"][:8],
+            })
+        process["top_adopted_experiences"] = enriched
+
+        process["top_miss_queries"] = self._metrics.get_search_miss_queries(since_days=30, limit=5)
+
+        from datetime import timedelta
+        cutoff_30 = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        all_exps_all_status = (
+            all_active
+            + self.list_pending()
+            + archived_exps
+        )
+        new_exps_30d = sum(1 for e in all_exps_all_status if e.created_at >= cutoff_30)
+        process["trend_30d"] = {
+            "new_experiences": new_exps_30d,
+            "new_sessions": process["new_sessions_30d"],
+        }
+
         return process
 
-    def get_search_strategy_comparison(self, since_days: Optional[int] = None) -> dict:
-        """获取检索策略对比数据"""
-        return self._metrics.get_search_strategy_comparison(since_days)
+
 
     def _infer_level(self, task: str, decisions: str) -> ExperienceLevel:
         text = (task + decisions).lower()
@@ -840,6 +945,55 @@ class KnowledgeService:
                 found.append(scene)
         return found
 
+    async def _check_duplicate(self, task_description: str, solution_summary: str):
+        from .embeddings import get_provider, cosine_similarity
+        from .storage import VectorStore
+        import numpy as np
+
+        candidates = self._store.list_active()
+        if not candidates:
+            return
+
+        provider = get_provider()
+        check_text = f"{task_description}\n{solution_summary}"
+        query_vec = np.array(provider.embed_text(check_text), dtype=np.float32)
+
+        v_store = VectorStore()
+        candidate_ids = [e.id for e in candidates]
+        ids, vecs = v_store.get_all_vectors(candidate_ids)
+
+        if len(vecs) == 0:
+            return
+
+        scores = cosine_similarity(query_vec, vecs)
+        for exp_id, score in zip(ids, scores):
+            if float(score) >= 0.85:
+                id_to_exp = {e.id: e for e in candidates}
+                dup_exp = id_to_exp.get(exp_id)
+                dup_title = dup_exp.title if dup_exp else exp_id[:8]
+                raise ValueError(
+                    f"已存在高度相似的经验（相似度 {score:.2f}）：[{exp_id[:8]}] {dup_title}。"
+                    f"建议复用或用 `xp edit {exp_id[:8]}` 更新已有经验，而非新增。"
+                )
+
+    async def _llm_generate_title(self, task_description: str) -> str:
+        import os
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("XP_LLM_API_KEY")
+        api_base = os.getenv("XP_LLM_API_BASE")
+        model = os.getenv("XP_LLM_MODEL", "gpt-4o-mini")
+        if not api_key:
+            raise RuntimeError("No LLM API key configured")
+        import openai
+        client = openai.AsyncOpenAI(api_key=api_key, base_url=api_base)
+        prompt = f"用10-15个字总结以下任务，只输出标题，不加标点：\n{task_description}"
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=30,
+            temperature=0,
+        )
+        return resp.choices[0].message.content.strip()
+
     def _make_title(self, task: str) -> str:
         return task[:60] + ("..." if len(task) > 60 else "")
 
@@ -877,9 +1031,8 @@ class KnowledgeService:
         if not solution:
             return None
 
-        # 自动提取关键词和标签
+        # 自动提取技术栈和场景标签
         all_text = f"{title}\n{problem}\n{solution}"
-        keywords = _extract_keywords(all_text)
         tech_stack = self._infer_tech_stack(all_text)
         scene = self._infer_scene(all_text)
 
@@ -899,6 +1052,5 @@ class KnowledgeService:
                 tech_stack=tech_stack if tech_stack else tags,
                 problem_type=self._infer_type(title, problem).value,
                 scene=scene,
-                keywords=keywords,
             ),
         )

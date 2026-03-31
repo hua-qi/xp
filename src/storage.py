@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from rank_bm25 import BM25Okapi
-
 from .models import (
     Experience,
     ExperienceLevel,
@@ -59,7 +57,10 @@ def _init_metrics_schema(conn: sqlite3.Connection):
             iteration_count INTEGER NOT NULL,
             had_error_correction INTEGER NOT NULL,
             user_accepted INTEGER NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            ab_test_group TEXT DEFAULT 'treatment',
+            ab_test_result_shown INTEGER DEFAULT 1,
+            result_shown_recorded INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS search_events (
@@ -95,56 +96,116 @@ def _init_metrics_schema(conn: sqlite3.Connection):
             adoption_rate REAL DEFAULT 0.0
         );
 
-        -- 检索策略 A/B 测试表：对比 BM25 vs Embedding vs Hybrid 的效果
-        CREATE TABLE IF NOT EXISTS search_strategy_ab_test (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            query TEXT NOT NULL,
-            strategy TEXT NOT NULL,  -- 'bm25_only', 'embedding_only', 'hybrid'
-            result_count INTEGER NOT NULL,
-            experience_ids_returned TEXT,  -- JSON 数组
-            created_at TEXT NOT NULL
-        );
 
-        -- 检索策略效果指标表：记录每种策略的长期效果
-        CREATE TABLE IF NOT EXISTS search_strategy_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy TEXT NOT NULL,  -- 'bm25_only', 'embedding_only', 'hybrid'
-            total_searches INTEGER DEFAULT 0,
-            total_hits INTEGER DEFAULT 0,  -- 有结果返回的次数
-            total_adoptions INTEGER DEFAULT 0,  -- 经验被采纳的次数
-            hit_rate REAL DEFAULT 0.0,
-            adoption_rate REAL DEFAULT 0.0,
-            avg_result_count REAL DEFAULT 0.0,
+
+        -- Experience 向量表
+        CREATE TABLE IF NOT EXISTS experience_vectors (
+            experience_id TEXT PRIMARY KEY,
+            vector BLOB NOT NULL,
             updated_at TEXT NOT NULL
         );
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN ab_test_group TEXT DEFAULT 'treatment'")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN ab_test_result_shown INTEGER DEFAULT 1")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN result_shown_recorded INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
 
 
-def _tokenize(text: str) -> list[str]:
-    """简单分词：小写、去标点、按空格和常见分隔符分割"""
-    text = text.lower()
-    # 保留中英文、数字，其他字符作为分隔符
-    tokens = re.findall(r'[a-z]+|[\u4e00-\u9fa5]+|\d+', text)
-    return tokens
 
 
-def _extract_keywords(text: str) -> list[str]:
-    """从文本中提取关键词（用于自动生成 metadata.keywords）"""
-    tokens = _tokenize(text)
-    # 过滤常见停用词
-    stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-                 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
-                 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
-                 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
-                 'below', 'between', 'under', 'again', 'further', 'then', 'once', '的',
-                 '是', '在', '和', '有', '了', '对', '就', '都', '而', '及', '与',
-                 '或', '但', '如果', '因为', '所以', '可以', '需要', '进行', '使用'}
-    keywords = [t for t in tokens if len(t) > 1 and t not in stopwords]
-    return list(set(keywords))  # 去重
+import struct
+import numpy as np
 
+class VectorStore:
+    def __init__(self):
+        self._conn = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = _get_metrics_conn()
+        return self._conn
+
+    def save_vector(self, exp_id: str, vector: list[float]):
+        conn = self._get_conn()
+        # Compress vector to binary
+        blob = struct.pack(f"{len(vector)}f", *vector)
+        conn.execute(
+            """INSERT INTO experience_vectors (experience_id, vector, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(experience_id) DO UPDATE SET
+               vector=excluded.vector, updated_at=excluded.updated_at""",
+            (exp_id, blob, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
+    def delete_vector(self, exp_id: str):
+        conn = self._get_conn()
+        conn.execute("DELETE FROM experience_vectors WHERE experience_id = ?", (exp_id,))
+        conn.commit()
+
+    def save_vectors(self, items: list[tuple[str, list[float]]]):
+        if not items:
+            return
+        conn = self._get_conn()
+        data = []
+        now = datetime.utcnow().isoformat()
+        for exp_id, vector in items:
+            blob = struct.pack(f"{len(vector)}f", *vector)
+            data.append((exp_id, blob, now))
+        conn.executemany(
+            """INSERT INTO experience_vectors (experience_id, vector, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(experience_id) DO UPDATE SET
+               vector=excluded.vector, updated_at=excluded.updated_at""",
+            data
+        )
+        conn.commit()
+
+    def get_vector(self, exp_id: str) -> Optional[np.ndarray]:
+        conn = self._get_conn()
+        row = conn.execute("SELECT vector FROM experience_vectors WHERE experience_id = ?", (exp_id,)).fetchone()
+        if not row:
+            return None
+        blob = row["vector"]
+        num_floats = len(blob) // 4
+        vector = struct.unpack(f"{num_floats}f", blob)
+        return np.array(vector, dtype=np.float32)
+
+    def get_all_vectors(self, exp_ids: Optional[list[str]] = None) -> tuple[list[str], np.ndarray]:
+        conn = self._get_conn()
+        if exp_ids is not None:
+            if not exp_ids:
+                return [], np.array([])
+            placeholders = ",".join(["?"] * len(exp_ids))
+            rows = conn.execute(f"SELECT experience_id, vector FROM experience_vectors WHERE experience_id IN ({placeholders})", exp_ids).fetchall()
+        else:
+            rows = conn.execute("SELECT experience_id, vector FROM experience_vectors").fetchall()
+        
+        if not rows:
+            return [], np.array([])
+            
+        ids = []
+        vecs = []
+        for row in rows:
+            ids.append(row["experience_id"])
+            blob = row["vector"]
+            num_floats = len(blob) // 4
+            vector = struct.unpack(f"{num_floats}f", blob)
+            vecs.append(vector)
+            
+        return ids, np.array(vecs, dtype=np.float32)
 
 class ExperienceStore:
     def add(self, exp: Experience) -> Experience:
@@ -167,6 +228,15 @@ class ExperienceStore:
         _save_knowledge(data)
         return True
 
+    def delete(self, exp_id: str) -> bool:
+        data = _load_knowledge()
+        if exp_id not in data:
+            return False
+        del data[exp_id]
+        _save_knowledge(data)
+        VectorStore().delete_vector(exp_id)
+        return True
+
     def list_by_status(self, status: ExperienceStatus) -> list[Experience]:
         data = _load_knowledge()
         return [
@@ -186,80 +256,6 @@ class ExperienceStore:
             counts[s] = counts.get(s, 0) + 1
         return counts
 
-    def search(
-        self,
-        query: str,
-        tech_stack: Optional[list[str]] = None,
-        problem_type: Optional[str] = None,
-        scene: Optional[list[str]] = None,
-        top_k: int = 5,
-        threshold: float = 0.1,
-    ) -> list[Experience]:
-        """
-        纯文本标签 + BM25 检索
-        
-        检索逻辑：
-        1. 标签过滤（精确匹配 metadata 字段）
-        2. BM25 排序（对 problem + solution 做关键词匹配）
-        3. 返回结果附带匹配理由
-        """
-        data = _load_knowledge()
-        
-        # 筛选 active 状态的经验
-        candidates = [
-            self._from_dict(v)
-            for v in data.values()
-            if v.get("status") == ExperienceStatus.ACTIVE.value
-        ]
-        
-        if not candidates:
-            return []
-
-        # 1. 标签过滤
-        if tech_stack:
-            candidates = [
-                exp for exp in candidates
-                if any(t in exp.metadata.tech_stack for t in tech_stack)
-            ]
-        
-        if problem_type:
-            candidates = [
-                exp for exp in candidates
-                if exp.metadata.problem_type == problem_type
-            ]
-        
-        if scene:
-            candidates = [
-                exp for exp in candidates
-                if any(s in exp.metadata.scene for s in scene)
-            ]
-
-        if not candidates:
-            return []
-
-        # 2. BM25 排序
-        # 构建语料库：title + problem + solution + keywords
-        corpus = []
-        for exp in candidates:
-            text = f"{exp.title}\n{exp.problem}\n{exp.solution}\n{' '.join(exp.metadata.keywords)}"
-            corpus.append(_tokenize(text))
-        
-        bm25 = BM25Okapi(corpus)
-        query_tokens = _tokenize(query)
-        scores = bm25.get_scores(query_tokens)
-        
-        # 组合结果
-        results = []
-        for i, (exp, score) in enumerate(zip(candidates, scores)):
-            if score >= threshold:
-                exp.similarity = round(score, 3)  # 复用 similarity 字段存储 BM25 分数
-                results.append((exp, score))
-        
-        # 按分数排序
-        results.sort(key=lambda x: x[1], reverse=True)
-        results = results[:top_k]
-        
-        return [exp for exp, _ in results]
 
     def _to_dict(self, exp: Experience) -> dict:
         return {
@@ -280,12 +276,12 @@ class ExperienceStore:
                 "tech_stack": exp.metadata.tech_stack,
                 "problem_type": exp.metadata.problem_type,
                 "scene": exp.metadata.scene,
-                "keywords": exp.metadata.keywords,
             },
             "file_hashes": exp.file_hashes,
             "project": exp.project,
             "last_hit_at": exp.last_hit_at,
             "stale_reason": exp.stale_reason,
+            "key_decisions": exp.key_decisions,
         }
 
     def _from_dict(self, d: dict) -> Experience:
@@ -294,12 +290,9 @@ class ExperienceStore:
             tech_stack=metadata_dict.get("tech_stack", []),
             problem_type=metadata_dict.get("problem_type", ""),
             scene=metadata_dict.get("scene", []),
-            keywords=metadata_dict.get("keywords", []),
         )
         
         # 向后兼容：如果没有 metadata，从 tags 推断
-        if not metadata.keywords and d.get("tags"):
-            metadata.keywords = d["tags"]
         if not metadata.tech_stack and d.get("tags"):
             metadata.tech_stack = d["tags"]
         
@@ -322,6 +315,7 @@ class ExperienceStore:
             project=d.get("project", "default"),
             last_hit_at=d.get("last_hit_at"),
             stale_reason=d.get("stale_reason"),
+            key_decisions=d.get("key_decisions", ""),
         )
 
 
@@ -333,75 +327,7 @@ class MetricsStore:
                 (query, result_count, datetime.utcnow().isoformat()),
             )
 
-    def record_search_strategy(
-        self,
-        session_id: str,
-        query: str,
-        strategy: str,  # 'bm25_only', 'embedding_only', 'hybrid'
-        result_count: int,
-        experience_ids: list[str],
-    ):
-        """记录检索策略 A/B 测试数据"""
-        with _get_metrics_conn() as conn:
-            conn.execute(
-                """INSERT INTO search_strategy_ab_test
-                   (session_id, query, strategy, result_count, experience_ids_returned, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, query, strategy, result_count, json.dumps(experience_ids), datetime.utcnow().isoformat()),
-            )
 
-    def update_search_strategy_metrics(self, strategy: str, had_result: bool, was_adopted: bool):
-        """更新检索策略的长期效果指标"""
-        with _get_metrics_conn() as conn:
-            conn.execute("""
-                INSERT INTO search_strategy_metrics
-                    (strategy, total_searches, total_hits, total_adoptions, updated_at)
-                VALUES (?, 1, ?, ?, ?)
-                ON CONFLICT(strategy) DO UPDATE SET
-                    total_searches = total_searches + 1,
-                    total_hits = total_hits + excluded.total_hits,
-                    total_adoptions = total_adoptions + excluded.total_adoptions,
-                    hit_rate = ROUND((total_hits + excluded.total_hits) * 1.0 / (total_searches + 1), 3),
-                    adoption_rate = ROUND(
-                        (total_adoptions + excluded.total_adoptions) * 1.0 / 
-                        NULLIF(total_hits + excluded.total_hits, 0), 3
-                    ),
-                    updated_at = excluded.updated_at
-            """, (strategy, 1 if had_result else 0, 1 if was_adopted else 0, datetime.utcnow().isoformat()))
-
-    def get_search_strategy_comparison(self, since_days: Optional[int] = None) -> dict:
-        """获取检索策略对比数据"""
-        conn = _get_metrics_conn()
-        date_filter = ""
-        params: list = []
-        if since_days:
-            cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
-            date_filter = "WHERE created_at >= ?"
-            params = [cutoff]
-
-        # 获取各策略的检索次数和命中率
-        rows = conn.execute(f"""
-            SELECT
-                strategy,
-                COUNT(*) as total_searches,
-                SUM(CASE WHEN result_count > 0 THEN 1 ELSE 0 END) as hits,
-                AVG(result_count) as avg_results
-            FROM search_strategy_ab_test
-            {date_filter}
-            GROUP BY strategy
-        """, params).fetchall()
-
-        result = {}
-        for row in rows:
-            result[row["strategy"]] = {
-                "total_searches": row["total_searches"],
-                "hits": row["hits"],
-                "hit_rate": round(row["hits"] / row["total_searches"], 3) if row["total_searches"] else 0,
-                "avg_results": round(row["avg_results"], 2),
-            }
-
-        conn.close()
-        return result
 
     def record_review(self, experience_id: str, action: str, reject_reason: Optional[str] = None):
         with _get_metrics_conn() as conn:
@@ -415,8 +341,8 @@ class MetricsStore:
             conn.execute(
                 """INSERT OR REPLACE INTO sessions
                    (session_id, task_description, experience_ids_injected,
-                    iteration_count, had_error_correction, user_accepted, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    iteration_count, had_error_correction, user_accepted, created_at, ab_test_group, ab_test_result_shown, result_shown_recorded)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
                 (
                     session.session_id,
                     session.task_description,
@@ -425,6 +351,8 @@ class MetricsStore:
                     int(session.had_error_correction),
                     int(session.user_accepted),
                     session.created_at,
+                    session.ab_test_group,
+                    int(session.ab_test_result_shown),
                 ),
             )
 
@@ -523,6 +451,34 @@ class MetricsStore:
             "reject_reasons": {r["reason"]: r["cnt"] for r in reject_reasons},
         }
 
+    def get_search_miss_queries(self, since_days: int = 30, limit: int = 10) -> list[dict]:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+        conn = _get_metrics_conn()
+        rows = conn.execute(
+            """SELECT query, COUNT(*) as cnt FROM search_events
+               WHERE result_count = 0 AND created_at >= ?
+               GROUP BY query ORDER BY cnt DESC LIMIT ?""",
+            (cutoff, limit)
+        ).fetchall()
+        conn.close()
+        return [{"query": r["query"], "count": r["cnt"]} for r in rows]
+
+    def get_recent_query_keywords(self, since_days: int = 30, top_k: int = 20) -> list[str]:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+        conn = _get_metrics_conn()
+        rows = conn.execute(
+            "SELECT query FROM search_events WHERE created_at >= ?", (cutoff,)
+        ).fetchall()
+        conn.close()
+        word_count: dict[str, int] = {}
+        for r in rows:
+            for word in r["query"].split():
+                if len(word) >= 2:
+                    word_count[word] = word_count.get(word, 0) + 1
+        return sorted(word_count, key=lambda w: -word_count[w])[:top_k]
+
     def get_experience_feedback_history(self, exp_id: str) -> list[Feedback]:
         """获取单条经验的反馈历史"""
         conn = _get_metrics_conn()
@@ -565,18 +521,84 @@ class MetricsStore:
         ).fetchall()
         review_counts = {r["action"]: r["cnt"] for r in review_rows}
 
-        sessions_with = conn.execute(
-            f"SELECT AVG(iteration_count) as avg_iter, AVG(had_error_correction) as avg_err, AVG(user_accepted) as avg_acc FROM sessions {date_filter} {'AND' if date_filter else 'WHERE'} json_array_length(experience_ids_injected) > 0",
+        sessions_shown = conn.execute(
+            f"SELECT COUNT(*) as cnt, AVG(iteration_count) as avg_iter, AVG(had_error_correction) as avg_err, AVG(user_accepted) as avg_acc FROM sessions {date_filter} {'AND' if date_filter else 'WHERE'} result_shown_recorded = 1 AND ab_test_result_shown = 1",
             params,
         ).fetchone()
 
-        sessions_without = conn.execute(
-            f"SELECT AVG(iteration_count) as avg_iter, AVG(had_error_correction) as avg_err, AVG(user_accepted) as avg_acc FROM sessions {date_filter} {'AND' if date_filter else 'WHERE'} json_array_length(experience_ids_injected) = 0",
+        sessions_not_shown = conn.execute(
+            f"SELECT COUNT(*) as cnt, AVG(iteration_count) as avg_iter, AVG(had_error_correction) as avg_err, AVG(user_accepted) as avg_acc FROM sessions {date_filter} {'AND' if date_filter else 'WHERE'} result_shown_recorded = 1 AND ab_test_result_shown = 0",
             params,
         ).fetchone()
 
         session_total = conn.execute(
             f"SELECT COUNT(*) as cnt FROM sessions {date_filter}", params
+        ).fetchone()["cnt"]
+
+        avg_result_count_row = conn.execute(
+            f"SELECT AVG(result_count) as avg_rc FROM search_events {date_filter}", params
+        ).fetchone()
+        avg_result_count = round(avg_result_count_row["avg_rc"] or 0, 2)
+
+        feedback_total = conn.execute(
+            f"SELECT COUNT(*) as cnt FROM feedback {date_filter}", params
+        ).fetchone()["cnt"]
+        feedback_adopted = conn.execute(
+            f"SELECT COUNT(*) as cnt FROM feedback {date_filter} {'AND' if date_filter else 'WHERE'} adopted = 1",
+            params,
+        ).fetchone()["cnt"]
+        query_adoption_rate = round(feedback_adopted / feedback_total, 3) if feedback_total else 0
+
+        top_adopted_rows = conn.execute(
+            """SELECT experience_id, adoption_rate, hit_count FROM experience_stats
+               WHERE hit_count >= 3
+               ORDER BY adoption_rate DESC LIMIT 3"""
+        ).fetchall()
+        top_adopted_experiences = [
+            {"experience_id": r["experience_id"], "adoption_rate": r["adoption_rate"], "hit_count": r["hit_count"]}
+            for r in top_adopted_rows
+        ]
+
+        zombie_count_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM experience_stats WHERE hit_count = 0"
+        ).fetchone()
+        zombie_count = zombie_count_row["cnt"]
+
+        ab_treatment = conn.execute(
+            f"""SELECT AVG(iteration_count) as avg_iter,
+                       AVG(had_error_correction) as avg_err,
+                       AVG(user_accepted) as avg_acc
+                FROM sessions {date_filter}
+                {'AND' if date_filter else 'WHERE'} ab_test_group = 'treatment'""",
+            params,
+        ).fetchone()
+
+        ab_control = conn.execute(
+            f"""SELECT AVG(iteration_count) as avg_iter,
+                       AVG(had_error_correction) as avg_err,
+                       AVG(user_accepted) as avg_acc
+                FROM sessions {date_filter}
+                {'AND' if date_filter else 'WHERE'} ab_test_group = 'control'""",
+            params,
+        ).fetchone()
+
+        ab_test_groups = {
+            "treatment": {
+                "avg_iterations": round(ab_treatment["avg_iter"] or 0, 2),
+                "error_rate": round(ab_treatment["avg_err"] or 0, 3),
+                "accept_rate": round(ab_treatment["avg_acc"] or 0, 3),
+            },
+            "control": {
+                "avg_iterations": round(ab_control["avg_iter"] or 0, 2),
+                "error_rate": round(ab_control["avg_err"] or 0, 3),
+                "accept_rate": round(ab_control["avg_acc"] or 0, 3),
+            },
+        }
+
+        from datetime import timedelta
+        cutoff_30 = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        new_sessions_30d = conn.execute(
+            "SELECT COUNT(*) as cnt FROM sessions WHERE created_at >= ?", (cutoff_30,)
         ).fetchone()["cnt"]
 
         conn.close()
@@ -590,14 +612,22 @@ class MetricsStore:
                 review_counts.get("confirmed", 0) / max(review_counts.get("confirmed", 0) + review_counts.get("rejected", 0), 1), 3
             ),
             "session_total": session_total,
-            "with_injection": {
-                "avg_iterations": round(sessions_with["avg_iter"] or 0, 2),
-                "error_rate": round(sessions_with["avg_err"] or 0, 3),
-                "accept_rate": round(sessions_with["avg_acc"] or 0, 3),
+            "result_shown": {
+                "count": sessions_shown["cnt"] or 0,
+                "avg_iterations": round(sessions_shown["avg_iter"] or 0, 2),
+                "error_rate": round(sessions_shown["avg_err"] or 0, 3),
+                "accept_rate": round(sessions_shown["avg_acc"] or 0, 3),
             },
-            "without_injection": {
-                "avg_iterations": round(sessions_without["avg_iter"] or 0, 2),
-                "error_rate": round(sessions_without["avg_err"] or 0, 3),
-                "accept_rate": round(sessions_without["avg_acc"] or 0, 3),
+            "result_not_shown": {
+                "count": sessions_not_shown["cnt"] or 0,
+                "avg_iterations": round(sessions_not_shown["avg_iter"] or 0, 2),
+                "error_rate": round(sessions_not_shown["avg_err"] or 0, 3),
+                "accept_rate": round(sessions_not_shown["avg_acc"] or 0, 3),
             },
+            "avg_result_count": avg_result_count,
+            "query_adoption_rate": query_adoption_rate,
+            "top_adopted_experiences": top_adopted_experiences,
+            "zombie_count_db": zombie_count,
+            "ab_test_groups": ab_test_groups,
+            "new_sessions_30d": new_sessions_30d,
         }

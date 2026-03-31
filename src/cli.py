@@ -99,10 +99,11 @@ def cmd_review(args):
         print(f"  ID:   {exp.id}")
         print(f"\n  问题:\n  {exp.problem[:300]}")
         print(f"\n  解决方案:\n  {exp.solution[:500]}")
+        if exp.key_decisions:
+            print(f"\n  关键决策/踩坑点:\n  {exp.key_decisions[:300]}")
         print(f"\n  元数据:")
         print(f"    技术栈: {', '.join(exp.metadata.tech_stack) if exp.metadata.tech_stack else '无'}")
         print(f"    场景: {', '.join(exp.metadata.scene) if exp.metadata.scene else '无'}")
-        print(f"    关键词: {', '.join(exp.metadata.keywords[:10])}..." if len(exp.metadata.keywords) > 10 else f"    关键词: {', '.join(exp.metadata.keywords)}")
         print("\n  操作: [y] 确认  [n] 拒绝  [s] 跳过  [q] 退出")
 
         while True:
@@ -175,35 +176,62 @@ def cmd_stats(args):
     print(f"\n{'=' * 50}")
     print(f"  XP 效果统计 ({period})")
     print(f"{'=' * 50}")
+
+    w = stats["result_shown"]
+    wo = stats["result_not_shown"]
+    w_n = w.get("count", 0)
+    wo_n = wo.get("count", 0)
+    print(f"\n--- 效果对比（共 {stats['session_total']} 次会话）---")
+    print(f"                    展示经验(n={w_n})  未展示经验(n={wo_n})")
+    print(f"  平均对话轮数      {w['avg_iterations']:<18.1f}{wo['avg_iterations']:.1f}")
+    print(f"  报错率            {w['error_rate'] * 100:<18.1f}{wo['error_rate'] * 100:.1f}%")
+    print(f"  用户接受率        {w['accept_rate'] * 100:<18.1f}{wo['accept_rate'] * 100:.1f}%")
+    if wo_n < 5:
+        print(f"  ⚠ 未展示经验组样本量不足（{wo_n} 次），数据仅供参考")
+
+    type_dist = stats.get("type_distribution", {})
+    type_str = "  ".join(f"{k} {v}" for k, v in type_dist.items()) if type_dist else "暂无"
     print(f"\n--- 知识库状态 ---")
     print(f"  Active 经验数:     {stats['active_count']}")
     print(f"  Pending 待 review: {stats['pending_count']}")
+    print(f"  Archived 归档:     {stats.get('archived_count', 0)}")
+    print(f"  类型分布:          {type_str}")
+    print(f"  平均置信度:        {stats.get('avg_confidence', 0):.2f}")
 
-    print(f"\n--- 过程指标 ---")
-    print(f"  检索触发次数:   {stats['search_total']}")
-    print(f"  检索命中率:     {stats['search_hit_rate'] * 100:.1f}%")
-    print(f"  候选确认数:     {stats['review_confirmed']}")
-    print(f"  候选拒绝数:     {stats['review_rejected']}")
-    print(f"  候选通过率:     {stats['review_pass_rate'] * 100:.1f}%")
+    print(f"\n--- 检索质量 ---")
+    print(f"  检索触发次数:      {stats['search_total']}")
+    print(f"  检索命中率:        {stats['search_hit_rate'] * 100:.1f}%")
+    print(f"  平均返回结果数:    {stats.get('avg_result_count', 0):.1f}")
+    print(f"  查询后采纳率:      {stats.get('query_adoption_rate', 0) * 100:.1f}%")
+    miss_queries = stats.get("top_miss_queries", [])
+    if miss_queries:
+        print(f"  Top 未命中查询（近30天）:")
+        for q in miss_queries[:3]:
+            print('    "' + q['query'] + f'" ({q["count"]} 次)')
 
-    print(f"\n--- 效果对比 (共 {stats['session_total']} 次会话) ---")
-    w = stats["with_injection"]
-    wo = stats["without_injection"]
-    print(f"                    有经验注入    无注入")
-    print(f"  平均对话轮数      {w['avg_iterations']:<14.1f}{wo['avg_iterations']:.1f}")
-    print(f"  报错率            {w['error_rate'] * 100:<14.1f}{wo['error_rate'] * 100:.1f}%")
-    print(f"  用户接受率        {w['accept_rate'] * 100:<14.1f}{wo['accept_rate'] * 100:.1f}%")
+    print(f"\n--- 经验价值分布 ---")
+    print(f"  候选确认数:        {stats['review_confirmed']}")
+    print(f"  候选拒绝数:        {stats['review_rejected']}")
+    print(f"  候选通过率:        {stats['review_pass_rate'] * 100:.1f}%")
+    top_adopted = stats.get("top_adopted_experiences", [])
+    if top_adopted:
+        print(f"  高采纳率 TOP {len(top_adopted)}:")
+        for exp_stat in top_adopted:
+            short_id = exp_stat["experience_id"][:8]
+            title = exp_stat.get("title", short_id)
+            print(f"    [{short_id}] {title}  采纳率 {exp_stat['adoption_rate'] * 100:.0f}%")
+    zombie = stats.get("zombie_count", 0)
+    if zombie:
+        print(f"  僵尸经验（从未命中）: {zombie} 条")
 
-    # 检索策略对比
-    strategy_stats = service.get_search_strategy_comparison(since_days)
-    if strategy_stats:
-        print(f"\n--- 检索策略对比 (A/B 测试) ---")
-        print(f"  策略            检索次数    命中次数    命中率    平均返回数")
-        for strategy, data in strategy_stats.items():
-            print(f"  {strategy:<14}  {data['total_searches']:<10}  {data['hits']:<10}  {data['hit_rate']*100:>5.1f}%  {data['avg_results']:.1f}")
+    trend = stats.get("trend_30d", {})
+    if trend:
+        print(f"\n--- 时间趋势（近 30 天）---")
+        print(f"  新增经验:          +{trend.get('new_experiences', 0)} 条")
+        print(f"  新增会话:          +{trend.get('new_sessions', 0)} 次")
 
     if stats["session_total"] < 10:
-        print(f"\n  注意: 当前会话数较少（{stats['session_total']} 次），对比数据仅供参考，建议积累 30 次以上后再做判断。")
+        print(f"\n  注意: 当前会话数较少（{stats['session_total']} 次），对比数据仅供参考。")
     print()
 
 
@@ -257,8 +285,25 @@ def cmd_analyze(args):
             print(f"      问题: {pattern['issue']}")
             print(f"      建议: {pattern['suggestion']}")
             print(f"      数据: {pattern['data']}")
+            actions = pattern.get("actions", [])
+            if actions:
+                print(f"      操作:")
+                for action in actions:
+                    print(f"        {action}")
     else:
         print("  未发现明显的质量问题")
+
+    all_actions = []
+    for p in report["low_quality_patterns"]:
+        all_actions.extend(p.get("actions", []))
+    if all_actions:
+        print(f"\n--- 下一步操作汇总（可直接复制执行）---")
+        seen: set[str] = set()
+        for action in all_actions:
+            cmd = action.split("#")[0].strip()
+            if cmd not in seen:
+                print(f"  {action}")
+                seen.add(cmd)
 
     print(f"\n--- 优化建议 ---")
     for rec in report["recommendations"]:
@@ -266,6 +311,125 @@ def cmd_analyze(args):
             print(f"  • {rec}")
 
     print(f"\n{'=' * 60}\n")
+
+
+def cmd_show(args):
+    if not args:
+        print("用法: xp show <经验ID前缀>")
+        sys.exit(1)
+    prefix = args[0]
+    service = _get_service()
+    from .models import ExperienceStatus
+    all_exps = []
+    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+        all_exps.extend(service._store.list_by_status(status))
+    matches = [e for e in all_exps if e.id.startswith(prefix)]
+    if len(matches) == 0:
+        print(f"未找到匹配 '{prefix}' 的经验")
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"匹配到 {len(matches)} 条经验，请提供更长的前缀：")
+        for e in matches:
+            print(f"  {e.id[:8]}  {e.status.value:8}  {e.title}")
+        sys.exit(1)
+    exp = matches[0]
+    print(f"\n{'=' * 60}")
+    print(f"  {exp.title}")
+    print(f"{'=' * 60}")
+    print(f"  ID:     {exp.id}")
+    print(f"  状态:   {exp.status.value}")
+    print(f"  类型:   {exp.type.value}  层级: {exp.level.value}")
+    print(f"  标签:   {', '.join(exp.tags) if exp.tags else '无'}")
+    print(f"  技术栈: {', '.join(exp.metadata.tech_stack) if exp.metadata.tech_stack else '无'}")
+    print(f"  创建于: {exp.created_at}")
+    print(f"  最近命中: {exp.last_hit_at or '从未'}")
+    print(f"\n  问题:\n  {exp.problem}")
+    print(f"\n  解决方案:\n  {exp.solution}")
+    if exp.metadata.scene:
+        print(f"\n  场景: {', '.join(exp.metadata.scene)}")
+    if exp.related_files:
+        print(f"  相关文件: {', '.join(exp.related_files)}")
+    print(f"\n{'=' * 60}\n")
+
+
+def cmd_edit(args):
+    if not args:
+        print("用法: xp edit <经验ID前缀>")
+        sys.exit(1)
+    prefix = args[0]
+    service = _get_service()
+    all_exps = []
+    from .models import ExperienceStatus
+    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+        all_exps.extend(service._store.list_by_status(status))
+    matches = [e for e in all_exps if e.id.startswith(prefix)]
+    if len(matches) != 1:
+        print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
+        sys.exit(1)
+    exp = matches[0]
+
+    print(f"\n{'=' * 60}")
+    print(f"  编辑经验: {exp.title}")
+    print(f"  ID: {exp.id}")
+    print(f"{'=' * 60}")
+    print("提示: 直接回车保留原值\n")
+
+    try:
+        new_title = input(f"标题 [{exp.title}]: ").strip()
+        if new_title:
+            exp.title = new_title
+
+        print(f"问题描述 (当前): {exp.problem[:200]}")
+        new_problem = input("新问题描述 (回车保留): ").strip()
+        if new_problem:
+            exp.problem = new_problem
+
+        print(f"解决方案 (当前): {exp.solution[:200]}")
+        new_solution = input("新解决方案 (回车保留): ").strip()
+        if new_solution:
+            exp.solution = new_solution
+
+        tags_str = ", ".join(exp.tags)
+        new_tags_input = input(f"标签 [{tags_str}]: ").strip()
+        if new_tags_input:
+            exp.tags = [t.strip() for t in new_tags_input.split(",") if t.strip()]
+
+        if exp.status == ExperienceStatus.ARCHIVED:
+            reactivate = input("是否重新激活为 Active? [y/N]: ").strip().lower()
+            if reactivate == "y":
+                exp.status = ExperienceStatus.ACTIVE
+    except KeyboardInterrupt:
+        print("\n已取消编辑")
+        return
+
+    service._store.update(exp)
+    print(f"\n已保存: [{exp.id[:8]}] {exp.title}  (状态: {exp.status.value})")
+
+
+def cmd_archive(args):
+    if not args:
+        print("用法: xp archive <经验ID前缀>")
+        sys.exit(1)
+    prefix = args[0]
+    service = _get_service()
+    exp = service.archive_experience(prefix)
+    if exp is None:
+        print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
+        sys.exit(1)
+    print(f"已归档: [{exp.id[:8]}] {exp.title}")
+
+
+def cmd_delete(args):
+    if not args:
+        print("用法: xp delete <经验ID前缀>")
+        sys.exit(1)
+    prefix = args[0]
+    service = _get_service()
+    exp_id = service.delete_experience(prefix)
+    if exp_id is None:
+        print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
+        sys.exit(1)
+    print(f"已删除: {exp_id[:8]}")
 
 
 def cmd_init(args):
@@ -401,6 +565,51 @@ def cmd_sync(args):
     asyncio.run(run())
 
 
+def cmd_migrate(args):
+    force = "--force" in args
+
+    async def run():
+        from .knowledge import KnowledgeService
+        from .project_config import ProjectManager
+        from .storage import ExperienceStore, MetricsStore
+        from .embeddings import get_provider
+        from .storage import VectorStore
+        from .models import ExperienceStatus
+
+        service = KnowledgeService(ExperienceStore(), MetricsStore(), ProjectManager().get_current())
+        provider = get_provider()
+        v_store = VectorStore()
+
+        all_exps = []
+        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+            all_exps.extend(service._store.list_by_status(status))
+
+        print(f"总经验数量: {len(all_exps)}")
+
+        if force:
+            missing_exps = all_exps
+            print(f"--force 模式：全量重新生成 {len(missing_exps)} 条经验的向量")
+        else:
+            ids, _ = v_store.get_all_vectors()
+            missing_exps = [e for e in all_exps if e.id not in ids]
+
+        if not missing_exps:
+            print("所有经验均已生成向量，无需迁移。")
+            return
+
+        print(f"发现 {len(missing_exps)} 条缺失向量的经验，开始生成...")
+        batch_size = 50
+        for i in range(0, len(missing_exps), batch_size):
+            batch = missing_exps[i:i+batch_size]
+            texts = [f"{e.title}\n{e.problem}\n{e.key_decisions}" for e in batch]
+            vecs = provider.embed_texts(texts)
+            v_store.save_vectors(list(zip([e.id for e in batch], vecs)))
+            print(f"进度: {min(i+batch_size, len(missing_exps))}/{len(missing_exps)}")
+
+        print("迁移完成。")
+
+    asyncio.run(run())
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -415,6 +624,7 @@ def main():
         print("  xp project [list|switch] 项目管理")
         print("  xp watch               检查文件变更和过期经验")
         print("  xp sync [up|down]      云端同步")
+        print("  xp migrate             为旧数据生成缺失的向量")
         return
 
     cmd = args[0]
@@ -422,6 +632,8 @@ def main():
 
     if cmd == "add":
         cmd_add(rest)
+    elif cmd == "migrate":
+        cmd_migrate(rest)
     elif cmd == "review":
         cmd_review(rest)
     elif cmd == "import":
@@ -430,6 +642,14 @@ def main():
         cmd_stats(rest)
     elif cmd == "analyze":
         cmd_analyze(rest)
+    elif cmd == "show":
+        cmd_show(rest)
+    elif cmd == "edit":
+        cmd_edit(rest)
+    elif cmd == "archive":
+        cmd_archive(rest)
+    elif cmd == "delete":
+        cmd_delete(rest)
     elif cmd == "init":
         cmd_init(rest)
     elif cmd == "project":

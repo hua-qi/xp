@@ -91,7 +91,7 @@ class SupabaseProvider(CloudProvider):
                     "tech_stack": exp.metadata.tech_stack,
                     "problem_type": exp.metadata.problem_type,
                     "scene": exp.metadata.scene,
-                    "keywords": exp.metadata.keywords,
+                    "keywords": [],
                 },
                 "confidence": exp.confidence,
                 "status": exp.status.value,
@@ -171,7 +171,7 @@ class SupabaseProvider(CloudProvider):
                 tech_stack=metadata.get("tech_stack", []),
                 problem_type=metadata.get("problem_type", ""),
                 scene=metadata.get("scene", []),
-                keywords=metadata.get("keywords", []),
+                # keywords field removed
             ),
         )
 
@@ -345,7 +345,7 @@ class ElasticsearchProvider(CloudProvider):
                 "solution": exp.solution,
                 "metadata": {
                     "tech_stack": exp.metadata.tech_stack,
-                    "keywords": exp.metadata.keywords,
+                    "keywords": [],
                 },
                 "confidence": exp.confidence,
                 "status": exp.status.value,
@@ -434,7 +434,7 @@ class ElasticsearchProvider(CloudProvider):
             project=d.get("project", "default"),
             metadata=ExperienceMetadata(
                 tech_stack=metadata.get("tech_stack", []),
-                keywords=metadata.get("keywords", []),
+                # keywords field removed
             ),
         )
 

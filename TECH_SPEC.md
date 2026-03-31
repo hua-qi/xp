@@ -118,11 +118,12 @@ xp import ./best-practices.md
 ### 1.3 存储
 
 - 经验数据：本地 JSON（`~/.xp/knowledge.json`）
-- 检索引擎：纯文本标签 + **BM25** 算法（`rank-bm25` 库）
-  - 检索逻辑：标签过滤 → BM25 排序 → 返回 TopK
-  - 无需向量 Embedding，轻量高效
+- 检索引擎：**BM25 + BGE-small-zh Embedding 混合检索**
+  - BM25（权重 70%）：精确匹配代码片段、函数名、配置项
+  - Embedding（权重 30%）：理解语义相似但字面不同的表达
+  - 检索逻辑：标签过滤 → BM25 + Embedding 混合排序 → 返回 TopK
+  - 向量索引存储在 SQLite `experience_vectors` 表（binary 压缩），随经验删除同步清除
 - 指标数据：本地 SQLite（`~/.xp/metrics.db`），结构简单、易于查询
-- 无需外部 Embedding 服务，零 API 成本
 
 ### 1.4 检索 + 注入
 
@@ -239,8 +240,12 @@ xp import ./best-practices.md
 - xp review CLI（人工确认）
 - xp import CLI（冷启动导入）
 - xp add CLI（交互式手动添加）
+- xp edit CLI（交互式编辑已有经验）
+- xp archive CLI（归档经验，停止参与检索）
+- xp delete CLI（永久删除经验，同步清除向量索引）
 - xp stats CLI（指标查看）
-- 本地 BM25 检索 + SQLite 指标库
+- xp analyze CLI（经验质量报告，含 7 类 pattern 检测与内联操作命令）
+- 本地 BM25 + Embedding 混合检索 + SQLite 指标库
 
 验证标准： 积累 30 次以上 session 后，xp stats 能输出有经验注入 vs 无注入的效果对比数据。
 
@@ -284,6 +289,20 @@ xp import ./best-practices.md
 ```bash
 xp analyze  # 输出经验质量报告：提取率、采纳率、低质量模式
 ```
+
+`xp analyze` 识别的低质量模式（共 7 类）：
+
+| pattern | 触发条件 | 内联操作命令 |
+|---------|----------|-------------|
+| `extraction_quality` | 整体采纳率 < 50% | 无（建议优化提取 prompt） |
+| `low_adoption` | 存在采纳率 < 30% 的经验 | `xp archive <id>` / `xp edit <id>` |
+| `reject_pattern` | 存在常见拒绝原因 | 无（建议优化提取逻辑） |
+| `staleness` | Active 经验超过 90 天未被检索命中 | `xp archive <id>` |
+| `search_miss` | 近 30 天有 query 返回 0 结果 | `xp add` |
+| `duplicate_cluster` | 经验间余弦相似度 >= 0.92 | `xp delete <id>` |
+| `coverage_gap` | 高频搜索词在知识库中无对应经验 | `xp add` |
+
+报告末尾汇总所有可执行命令，可直接复制粘贴到终端执行。
 
 ### 2.4 人工 review 减负
 
@@ -351,11 +370,11 @@ xp init --project "mobile-app" --tags "react-native,typescript"
 ## 技术选型建议
 
 | 模块 | Phase 1 | Phase 2/3 |
-|------|---------|-----------|
+|------|---------|-----------| 
 | 存储 | 本地 JSON | 云端数据库（Supabase / Weaviate / ES） |
-| 检索引擎 | BM25（纯文本） | BM25（纯文本，禁用向量） |
-| Embedding | 无需 | 无需（前后端均禁用） |
-| 指标存储 | 本地 SQLite | 云端（随知识库一起迁移） |
+| 检索引擎 | BM25 + Embedding 混合检索（70/30） | 同左，可调权重 |
+| Embedding | BGE-small-zh（本地推理） | 同左 |
+| 指标存储 | 本地 SQLite（含向量索引） | 云端（随知识库一起迁移） |
 | 入口 | MCP Server + CLI | 同左 |
 | 语言 | Python | 同左 |
 

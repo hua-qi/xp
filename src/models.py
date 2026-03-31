@@ -33,7 +33,6 @@ class ExperienceMetadata:
     tech_stack: list[str] = field(default_factory=list)      # 技术栈：["react", "typescript"]
     problem_type: str = ""                                    # 问题类型：bugfix/feature/pattern
     scene: list[str] = field(default_factory=list)           # 场景标签：["表单", "列表", "异步"]
-    keywords: list[str] = field(default_factory=list)        # 关键词：["useEffect", "infinite loop"]
 
 
 @dataclass
@@ -58,6 +57,7 @@ class Experience:
     project: str = "default"  # 所属项目
     last_hit_at: Optional[str] = None  # 最后使用时间，用于 TTL
     stale_reason: Optional[str] = None  # 失效原因
+    key_decisions: str = ""
 
 
 @dataclass
