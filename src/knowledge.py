@@ -292,94 +292,15 @@ class KnowledgeService:
         enable_ab_test: bool = True,
         enable_strategy_ab_test: bool = True,
     ) -> tuple[list[Experience], dict]:
-        """
-        纯向量检索
-
-        参数:
-            query: 查询文本（任务描述或问题描述）
-            tags: 技术栈标签过滤（可选）
-            top_k: 返回条数
-            threshold: 余弦相似度阈值
-            cross_project: 是否跨项目检索
-            session_id: 会话 ID，用于 A/B 测试分组
-            enable_ab_test: 是否启用整体 A/B 测试（有经验 vs 无经验）
-            enable_strategy_ab_test: 兼容保留，实际只走 embedding_only
-
-        Returns:
-            (经验列表, 元数据字典包含 ab_test_group, strategy)
-        """
-        ab_test_group = "treatment"
-        show_results = True
-        if enable_ab_test and session_id:
-            import hashlib
-            hash_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16)
-            if hash_val % 10 == 0:  # 10% 对照组
-                ab_test_group = "control"
-                show_results = False
-
-        candidates = self._store.list_active()
-        if not cross_project:
-            candidates = [e for e in candidates if e.project == self._project]
-
-        valid_candidates = []
-        for exp in candidates:
-            if self._ttl_manager.is_expired(exp.last_hit_at):
-                continue
-            if exp.stale_reason:
-                continue
-            if tags and not any(t in exp.metadata.tech_stack for t in tags):
-                continue
-            valid_candidates.append(exp)
-
-        if not show_results or not valid_candidates:
-            self._metrics.record_search(query, 0)
-            return [], {"ab_test_group": ab_test_group, "show_results": show_results, "strategy": "embedding_only"}
-
-        from .embeddings import get_provider, cosine_similarity
+        from .domain.search import SearchService
+        from .embeddings import get_provider
         from .storage import VectorStore
-        import numpy as np
-
-        provider = get_provider()
-        query_vec = np.array(provider.embed_text(query), dtype=np.float32)
-
-        v_store = VectorStore()
-        candidate_ids = [e.id for e in valid_candidates]
-        ids, vecs = v_store.get_all_vectors(candidate_ids)
-        
-        # 补全缺失的向量
-        missing_exps = [e for e in valid_candidates if e.id not in ids]
-        if missing_exps:
-            missing_texts = [f"{e.title}\n{e.problem}\n{e.key_decisions}" for e in missing_exps]
-            missing_vecs = provider.embed_texts(missing_texts)
-            v_store.save_vectors(list(zip([e.id for e in missing_exps], missing_vecs)))
-            # 重新获取
-            ids, vecs = v_store.get_all_vectors(candidate_ids)
-
-        if len(vecs) == 0:
-            return [], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "embedding_only"}
-
-        scores = cosine_similarity(query_vec, vecs)
-        
-        results = []
-        id_to_exp = {e.id: e for e in valid_candidates}
-        for exp_id, score in zip(ids, scores):
-            if score >= threshold:
-                exp = id_to_exp[exp_id]
-                exp.similarity = round(float(score), 3)
-                results.append((exp, score))
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        results = results[:top_k]
-
-        now = datetime.utcnow().isoformat()
-        for exp, _ in results:
-            exp.last_hit_at = now
-            self._store.update(exp)
-
-        experience_ids = [exp.id for exp, _ in results]
-        self._metrics.record_search(query, len(results))
-
-        return [exp for exp, _ in results], {"ab_test_group": ab_test_group, "show_results": True, "strategy": "embedding_only"}
+        svc = SearchService(
+            self._store, VectorStore(), self._metrics,
+            get_provider(), project=self._project
+        )
+        return await svc.search(query, tags, top_k, threshold,
+                                cross_project, session_id, enable_ab_test)
 
     async def record_session(self, session: Session):
         self._metrics.record_session(session)
