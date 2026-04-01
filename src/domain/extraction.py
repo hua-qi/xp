@@ -98,6 +98,7 @@ class ExtractionService:
         if quality_score >= 80:
             exp.status = ExperienceStatus.ACTIVE
             exp.confidence = 0.65
+            self._store.update(exp)
 
         from src.embeddings import get_provider
         provider = get_provider()
