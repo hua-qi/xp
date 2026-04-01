@@ -45,4 +45,37 @@ def create_app() -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.get("/api/experiences/search")
+    async def search_experiences(
+        q: str,
+        top_k: int = 3,
+        session_id: Optional[str] = None,
+        tags: Optional[str] = None,
+    ):
+        store = ExperienceStore()
+        metrics = MetricsStore()
+        svc = KnowledgeService(store, metrics)
+        tag_list = tags.split(",") if tags else None
+        exps, meta = await svc.search(
+            query=q,
+            tags=tag_list,
+            top_k=top_k,
+            session_id=session_id,
+        )
+        return {
+            "results": [
+                {
+                    "id": e.id,
+                    "title": e.title,
+                    "solution": e.solution,
+                    "key_decisions": e.key_decisions,
+                    "similarity": getattr(e, "similarity", None),
+                    "confidence": e.confidence,
+                    "tags": e.tags,
+                }
+                for e in exps
+            ],
+            "metadata": meta,
+        }
+
     return app
