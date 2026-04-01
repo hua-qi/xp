@@ -113,71 +113,13 @@ class KnowledgeService:
 
     # Phase 3: 云端同步
     async def enable_cloud_sync(self, provider: str, **config) -> bool:
-        """启用云端同步"""
-        from .cloud_providers import CloudSyncManager
-        sync_manager = CloudSyncManager()
-
-        if not await sync_manager.connect(provider, **config):
-            return False
-
-        # 更新项目配置
-        self._project_manager.enable_cloud_sync(self._project, provider, **config)
-        return True
+        raise NotImplementedError("Cloud sync has been removed. Use the REST API for team sharing.")
 
     async def sync_to_cloud(self) -> dict:
-        """同步本地经验到云端"""
-        from .cloud_providers import CloudSyncManager
-
-        config = self.get_current_project_config()
-        if not config or not config.cloud_sync_enabled:
-            return {"error": "Cloud sync not enabled"}
-
-        sync_manager = CloudSyncManager()
-        if not await sync_manager.connect(config.cloud_provider, **config.cloud_config):
-            return {"error": "Failed to connect to cloud"}
-
-        # 获取当前项目的所有经验
-        all_exps = []
-        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-            all_exps.extend(self._store.list_by_status(status))
-
-        project_exps = [e for e in all_exps if e.project == self._project]
-
-        result = await sync_manager.sync_upload_all(project_exps)
-        await sync_manager.disconnect()
-        return result
+        raise NotImplementedError("Cloud sync has been removed. Use the REST API for team sharing.")
 
     async def sync_from_cloud(self) -> dict:
-        """从云端同步经验到本地"""
-        from .cloud_providers import CloudSyncManager
-
-        config = self.get_current_project_config()
-        if not config or not config.cloud_sync_enabled:
-            return {"error": "Cloud sync not enabled", "count": 0}
-
-        sync_manager = CloudSyncManager()
-        if not await sync_manager.connect(config.cloud_provider, **config.cloud_config):
-            return {"error": "Failed to connect to cloud", "count": 0}
-
-        # 下载云端经验
-        cloud_exps = await sync_manager.sync_download_all(self._project)
-
-        # 合并到本地
-        merged = 0
-        new = 0
-        for exp in cloud_exps:
-            existing = self._store.get(exp.id)
-            if existing:
-                # 更新现有经验
-                self._store.update(exp)
-                merged += 1
-            else:
-                # 新增经验
-                self._store.add(exp)
-                new += 1
-
-        await sync_manager.disconnect()
-        return {"merged": merged, "new": new, "total": len(cloud_exps)}
+        raise NotImplementedError("Cloud sync has been removed. Use the REST API for team sharing.")
 
     async def extract_experience(
         self,
