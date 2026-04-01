@@ -37,6 +37,12 @@ class SessionRequest(BaseModel):
     result_shown: bool = True
 
 
+class InferAdoptionRequest(BaseModel):
+    session_id: str
+    final_response: str
+    experience_ids_injected: list = []
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="xp-server", version="0.3.0")
 
@@ -164,5 +170,17 @@ def create_app() -> FastAPI:
         metrics = MetricsStore()
         svc = KnowledgeService(store, metrics)
         return svc.get_stats(since)
+
+    @app.post("/api/infer-adoption")
+    async def infer_adoption(req: InferAdoptionRequest):
+        store = ExperienceStore()
+        metrics = MetricsStore()
+        svc = KnowledgeService(store, metrics)
+        results = await svc.infer_adoption(
+            session_id=req.session_id,
+            final_response=req.final_response,
+            experience_ids_injected=req.experience_ids_injected,
+        )
+        return {"results": results}
 
     return app

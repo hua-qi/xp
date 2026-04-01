@@ -89,3 +89,14 @@ class TestRESTAPI:
         assert response.status_code == 200
         data = response.json()
         assert "active_count" in data
+
+    def test_post_infer_adoption(self, seeded_client):
+        client, exp_id = seeded_client
+        response = client.post("/api/infer-adoption", json={
+            "session_id": "s-001",
+            "final_response": "用 useRef 解决了防抖问题",
+            "experience_ids_injected": [exp_id],
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert "results" in data
