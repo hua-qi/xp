@@ -188,98 +188,15 @@ class KnowledgeService:
         tags: Optional[list[str]] = None,
         related_files: Optional[list[str]] = None,
     ) -> Experience:
-        tags = tags or []
-        related_files = related_files or []
-
-        if not key_decisions or len(key_decisions.strip()) < 10:
-            raise ValueError(
-                "key_decisions 不能为空且长度不得少于 10 字。"
-                "请补充关键决策/踩坑点后重试。"
-            )
-        if not solution_summary or len(solution_summary.strip()) < 20:
-            raise ValueError(
-                "solution_summary 长度不得少于 20 字。"
-                "请补充解决方案摘要后重试。"
-            )
-
-        await self._check_duplicate(task_description, solution_summary)
-
-        level = self._infer_level(task_description, key_decisions)
-        exp_type = self._infer_type(task_description, key_decisions)
-
-        # 取消关键词提取，使用纯向量
-        all_text = f"{task_description}\n{solution_summary}\n{key_decisions}"
-        if conversation_summary:
-            all_text = f"{all_text}\n{conversation_summary}"
-
-        # 自动推断技术栈标签
-        tech_stack = self._infer_tech_stack(all_text)
-
-        # 自动推断场景标签
-        scene = self._infer_scene(all_text)
-
-        quality_score = self._compute_quality_score(
-            key_decisions=key_decisions,
-            solution_summary=solution_summary,
-            related_files=related_files,
-            tech_stack=tech_stack if tech_stack else tags,
-        )
-
-        if quality_score < 40:
-            raise ValueError(
-                f"经验质量评分过低（{quality_score}/100），提取已拒绝。"
-                f"请补充：key_decisions（当前{len(key_decisions.strip())}字，建议>=50字）"
-                f"，solution_summary（当前{len(solution_summary.strip())}字，建议>=50字）"
-                f"，相关文件路径，技术栈标签。"
-            )
-
-        # Phase 3: 计算相关文件的 hash
-        file_hashes = calculate_files_hashes(related_files)
-
+        from .domain.extraction import ExtractionService
+        from .storage import VectorStore
         try:
             title = await self._llm_generate_title(task_description)
         except Exception:
-            title = self._make_title(task_description)
-
-        exp = Experience(
-            id=str(uuid.uuid4()),
-            type=exp_type,
-            level=level,
-            title=title,
-            tags=tags,  # 向后兼容
-            problem=task_description,
-            solution=solution_summary,
-            key_decisions=key_decisions,
-            confidence=0.6,
-            status=ExperienceStatus.PENDING,
-            source=ExperienceSource.AGENT,
-            created_at=datetime.utcnow().isoformat(),
-            related_files=related_files,
-            metadata=ExperienceMetadata(
-                tech_stack=tech_stack if tech_stack else tags,
-                problem_type=exp_type.value,
-                scene=scene,
-            ),
-            file_hashes=file_hashes,
-            project=self._project,
-        )
-
-
-        exp = self._store.add(exp)
-
-        if quality_score >= 80:
-            exp.status = ExperienceStatus.ACTIVE
-            exp.confidence = 0.65
-
-        # Phase 4: 生成向量并保存
-        from .embeddings import get_provider
-        from .storage import VectorStore
-        provider = get_provider()
-        exp_text = f"{exp.title}\n{exp.problem}\n{exp.key_decisions}"
-        vec = provider.embed_text(exp_text)
-        VectorStore().save_vector(exp.id, vec)
-        
-        return exp
+            title = None
+        svc = ExtractionService(self._store, VectorStore(), project=self._project)
+        return await svc.extract(task_description, solution_summary, key_decisions,
+                                 conversation_summary, tags, related_files, title=title)
 
     async def search(
         self,
