@@ -267,7 +267,7 @@ xp stats
   metrics.db        # SQLite 指标库（含检索事件、向量索引、审核事件、会话记录、反馈记录）
 ```
 
-经验检索采用 **BM25 + BGE-small-zh Embedding 混合检索**（BM25 权重 70%，Embedding 权重 30%）。向量索引存储在 `metrics.db` 的 `experience_vectors` 表中，删除经验时会同步清除对应向量。
+经验检索采用 **BGE-small-zh Embedding 向量检索**，基于余弦相似度排序。向量索引存储在 `metrics.db` 的 `experience_vectors` 表中，删除经验时会同步清除对应向量。
 
 ---
 

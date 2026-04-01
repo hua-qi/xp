@@ -21,7 +21,7 @@ agent 开始任何任务
         ↓
   [人工 review] 确认/拒绝/编辑候选经验
         ↓
-   [BM25 检索引擎] ← 任务描述
+   [检索引擎] ← 任务描述
         ↓
    [动态权重更新] ← 反馈数据
 ```
@@ -92,7 +92,7 @@ Agent 调用此 tool 后，系统自动：
 
 说明：
 - `metadata` 用于结构化检索，包含技术栈、问题类型、场景标签、关键词
-- 关键词通过 BM25 算法自动提取，结合标签过滤实现高效检索
+- 关键词结合标签过滤实现高效检索
 - `tags` 字段保留向后兼容，实际检索优先使用 `metadata.tech_stack` 和 `metadata.keywords`
 
 ### 1.2 人工 review：辅助确认
@@ -118,10 +118,9 @@ xp import ./best-practices.md
 ### 1.3 存储
 
 - 经验数据：本地 JSON（`~/.xp/knowledge.json`）
-- 检索引擎：**BM25 + BGE-small-zh Embedding 混合检索**
-  - BM25（权重 70%）：精确匹配代码片段、函数名、配置项
-  - Embedding（权重 30%）：理解语义相似但字面不同的表达
-  - 检索逻辑：标签过滤 → BM25 + Embedding 混合排序 → 返回 TopK
+- 检索引擎：**BGE-small-zh Embedding 向量检索**
+  - 余弦相似度排序，返回 TopK
+  - 检索逻辑：标签过滤 → Embedding 相似度排序 → 返回 TopK
   - 向量索引存储在 SQLite `experience_vectors` 表（binary 压缩），随经验删除同步清除
 - 指标数据：本地 SQLite（`~/.xp/metrics.db`），结构简单、易于查询
 
@@ -158,8 +157,8 @@ xp import ./best-practices.md
 
 检索逻辑：
 1. **标签过滤**：按 `metadata.tech_stack`、`metadata.problem_type`、`metadata.scene` 精确匹配
-2. **BM25 排序**：对 `title + problem + solution + keywords` 做关键词匹配打分
-3. **返回结果**：附带 `bm25_score` 和相关元数据，供 agent 参考
+2. **Embedding 排序**：对 `title + problem + key_decisions` 计算余弦相似度打分
+3. **返回结果**：附带 `similarity` 和相关元数据，供 agent 参考
 
 检索返回结果时附带 `experience_id`，供 `record_session` 记录使用效果。
 
@@ -245,7 +244,7 @@ xp import ./best-practices.md
 - xp delete CLI（永久删除经验，同步清除向量索引）
 - xp stats CLI（指标查看）
 - xp analyze CLI（经验质量报告，含 7 类 pattern 检测与内联操作命令）
-- 本地 BM25 + Embedding 混合检索 + SQLite 指标库
+- 本地 Embedding 向量检索 + SQLite 指标库
 
 验证标准： 积累 30 次以上 session 后，xp stats 能输出有经验注入 vs 无注入的效果对比数据。
 
@@ -372,7 +371,7 @@ xp init --project "mobile-app" --tags "react-native,typescript"
 | 模块 | Phase 1 | Phase 2/3 |
 |------|---------|-----------| 
 | 存储 | 本地 JSON | 云端数据库（Supabase / Weaviate / ES） |
-| 检索引擎 | BM25 + Embedding 混合检索（70/30） | 同左，可调权重 |
+| 检索引擎 | Embedding 向量检索 | 同左 |
 | Embedding | BGE-small-zh（本地推理） | 同左 |
 | 指标存储 | 本地 SQLite（含向量索引） | 云端（随知识库一起迁移） |
 | 入口 | MCP Server + CLI | 同左 |

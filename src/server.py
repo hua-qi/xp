@@ -218,6 +218,69 @@ async def list_tools() -> list[Tool]:
                 "required": ["session_id", "final_response", "experience_ids_injected"],
             },
         ),
+        Tool(
+            name="finalize_task",
+            description=(
+                "【任务完成后一键完成】替代原有的 extract_experience + record_session + infer_adoption 三步调用。"
+                "内部三步独立容错：提取失败不影响会话记录；无需手动调用其他工具。"
+                "每次任务完成后只需调用这一个工具即可。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "会话 ID，与 search_best_practices 中传入的 session_id 一致",
+                    },
+                    "task_description": {
+                        "type": "string",
+                        "description": "【必填】你要解决什么问题？一句话说清",
+                    },
+                    "solution_summary": {
+                        "type": "string",
+                        "description": "【必填】最终怎么解决的？核心思路",
+                    },
+                    "key_decisions": {
+                        "type": "string",
+                        "description": "【必填】有什么坑要注意？这是最有价值的部分",
+                    },
+                    "final_response": {
+                        "type": "string",
+                        "description": "【必填】任务的最终回复内容，用于推断经验采纳情况",
+                    },
+                    "conversation_summary": {
+                        "type": "string",
+                        "description": "【推荐】对话过程摘要，包含关键排查步骤",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "技术栈标签",
+                    },
+                    "related_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "涉及的关键文件路径",
+                    },
+                    "iteration_count": {
+                        "type": "integer",
+                        "description": "对话轮数，默认 1",
+                        "default": 1,
+                    },
+                    "had_error_correction": {
+                        "type": "boolean",
+                        "description": "是否出现过报错修正",
+                        "default": False,
+                    },
+                    "user_accepted": {
+                        "type": "boolean",
+                        "description": "用户是否接受结果",
+                        "default": True,
+                    },
+                },
+                "required": ["session_id", "task_description", "solution_summary", "key_decisions", "final_response"],
+            },
+        ),
     ]
 
 
@@ -274,7 +337,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "tags": exp.tags,
                 "problem": exp.problem,
                 "solution": exp.solution,
-                "bm25_score": exp.similarity,
+                "similarity": exp.similarity,
                 "metadata": {
                     "tech_stack": exp.metadata.tech_stack,
                     "problem_type": exp.metadata.problem_type,
@@ -343,6 +406,35 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "session_id": arguments["session_id"],
                 "results": results,
                 "message": f"已自动推断 {len(results)} 条经验的采纳情况，反馈已记录。",
+            }, ensure_ascii=False, indent=2),
+        )]
+
+    elif name == "finalize_task":
+        result = await service.finalize_task(
+            session_id=arguments["session_id"],
+            task_description=arguments["task_description"],
+            solution_summary=arguments["solution_summary"],
+            key_decisions=arguments["key_decisions"],
+            final_response=arguments["final_response"],
+            conversation_summary=arguments.get("conversation_summary"),
+            tags=arguments.get("tags", []),
+            related_files=arguments.get("related_files", []),
+            iteration_count=arguments.get("iteration_count", 1),
+            had_error_correction=arguments.get("had_error_correction", False),
+            user_accepted=arguments.get("user_accepted", True),
+        )
+        return [TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "ok",
+                **result,
+                "message": (
+                    f"经验已提取 [{result['extract']['id'][:8] if result['extract']['id'] else '跳过'}]，"
+                    f"会话已记录，"
+                    f"采纳推断完成（{len(result['adoption'].get('results', []))} 条）。"
+                    if result['extract']['status'] == 'ok'
+                    else f"会话已记录（提取跳过：{result['extract']['reason']}）"
+                ),
             }, ensure_ascii=False, indent=2),
         )]
 

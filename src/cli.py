@@ -79,6 +79,13 @@ def cmd_add(args):
 
 
 def cmd_review(args):
+    admin_key = os.environ.get("XP_ADMIN_KEY")
+    if admin_key:
+        user_key = os.environ.get("XP_USER_KEY", "")
+        if user_key != admin_key:
+            print("错误：xp review 需要 Admin 权限。请设置 XP_USER_KEY 环境变量。")
+            sys.exit(1)
+
     from .storage import ExperienceStore, MetricsStore
     from .models import ExperienceStatus
 
@@ -104,7 +111,7 @@ def cmd_review(args):
         print(f"\n  元数据:")
         print(f"    技术栈: {', '.join(exp.metadata.tech_stack) if exp.metadata.tech_stack else '无'}")
         print(f"    场景: {', '.join(exp.metadata.scene) if exp.metadata.scene else '无'}")
-        print("\n  操作: [y] 确认  [n] 拒绝  [s] 跳过  [q] 退出")
+        print("\n  操作: [y] 确认  [e] 编辑后确认  [n] 拒绝（原因必填）  [b] 批量确认剩余  [s] 跳过  [q] 退出")
 
         while True:
             choice = input("  > ").strip().lower()
@@ -115,14 +122,53 @@ def cmd_review(args):
                 metrics.record_review(exp.id, "confirmed")
                 print("  已确认并加入知识库。")
                 break
+            elif choice == "e":
+                import tempfile, subprocess
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+                    f.write(f"# {exp.title}\n\n")
+                    f.write(f"**问题:**\n{exp.problem}\n\n")
+                    f.write(f"**解决方案:**\n{exp.solution}\n\n")
+                    f.write(f"**关键决策:**\n{exp.key_decisions}\n\n")
+                    f.write(f"**标签:** {', '.join(exp.tags)}\n")
+                    tmp_path_name = f.name
+                editor = os.environ.get("EDITOR", "vi")
+                subprocess.call([editor, tmp_path_name])
+                content = open(tmp_path_name, encoding="utf-8").read()
+                lines = content.splitlines()
+                if lines:
+                    exp.title = lines[0].lstrip("# ").strip() or exp.title
+                exp.status = ExperienceStatus.ACTIVE
+                exp.confidence = 1.0
+                store.update(exp)
+                import asyncio as _asyncio
+                from src.knowledge import KnowledgeService
+                from src.storage import MetricsStore as _MetricsStore
+                svc = KnowledgeService(store, _MetricsStore())
+                _asyncio.run(svc.edit_and_confirm(exp.id))
+                metrics.record_review(exp.id, "confirmed")
+                print("  已编辑并确认，confidence = 1.0。")
+                break
             elif choice == "n":
-                reason = input("  拒绝原因（可直接回车跳过）: ").strip() or None
+                reason = ""
+                while not reason:
+                    reason = input("  拒绝原因（必填）: ").strip()
+                    if not reason:
+                        print("  拒绝原因不能为空，请重新输入。")
                 exp.status = ExperienceStatus.ARCHIVED
                 exp.reject_reason = reason
                 store.update(exp)
                 metrics.record_review(exp.id, "rejected", reason)
                 print("  已拒绝并归档。")
                 break
+            elif choice == "b":
+                remaining = pending[i-1:]
+                for r_exp in remaining:
+                    r_exp.status = ExperienceStatus.ACTIVE
+                    r_exp.confidence = 0.65
+                    store.update(r_exp)
+                    metrics.record_review(r_exp.id, "confirmed")
+                print(f"  已批量确认剩余 {len(remaining)} 条经验（confidence = 0.65）。")
+                return
             elif choice == "s":
                 print("  已跳过。")
                 break
@@ -130,7 +176,7 @@ def cmd_review(args):
                 print("\n已退出 review。")
                 return
             else:
-                print("  请输入 y / n / s / q")
+                print("  请输入 y / e / n / b / s / q")
 
     print("\nreview 完成。")
 

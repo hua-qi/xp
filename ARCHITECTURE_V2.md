@@ -5,7 +5,7 @@
 支持团队多人使用 MCP 和 XP 工具，实现经验沉淀和共享：
 - 多人通过 IDE (Claude/Cursor/Windsurf) 使用 MCP 协议共享经验库
 - 统一的 Web 服务部署在云端
-- 保留现有的纯文本 BM25 检索方案
+- 保留现有的 Embedding 向量检索方案
 
 ## 2. 整体架构
 
@@ -14,7 +14,7 @@
                     │      快手 K8s 集群        │
                     │  ┌────────────────────┐  │
                     │  │   xp-server        │  │  ← MCP over SSE
-                    │  │  - BM25 检索       │  │
+                    │  │  - Embedding 检索  │  │
                     │  └────────┬───────────┘  │
                     │           │              │
                     │  ┌────────┴───────────┐  │
@@ -59,7 +59,7 @@ xp-cli 管理工具 (pip install)
 
 **职责**：
 - 提供 MCP 协议接口（SSE transport）
-- 经验检索（BM25）
+- 经验检索（Embedding 向量检索）
 - 经验存储（PostgreSQL）
 - 用户身份识别
 
@@ -219,83 +219,38 @@ server:
   api_key: xxxx-xxxx-xxxx
 ```
 
-## 5. BM25 检索方案
+## 5. Embedding 向量检索方案
 
-### 5.1 方案对比
+### 5.1 方案说明
 
-| 方案 | 实现方式 | 适用场景 |
-|------|----------|----------|
-| **A. 内存 BM25** | Server 启动加载全部 active 经验到内存，使用 rank-bm25 库计算 | 经验量 < 10万，低延迟 |
-| **B. PostgreSQL 全文检索** | 使用 to_tsvector + GIN 索引，原生 SQL 检索 | 经验量大，无需额外内存 |
-
-### 5.2 推荐方案：内存 BM25
-
-保持与当前实现一致，代码改动最小：
+使用 BGE-small-zh-v1.5 本地推理，将经验文本编码为向量后存入 SQLite，检索时计算余弦相似度排序：
 
 ```python
-# server.py 中的检索逻辑
-from rank_bm25 import BM25Okapi
-import re
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 class ExperienceService:
     def __init__(self, db):
         self.db = db
-        self._cache = {}  # id -> Experience
-        self._bm25 = None
-        self._corpus = []
-        self._refresh_cache()
-    
-    def _refresh_cache(self):
-        """从数据库加载 active 经验到内存"""
-        rows = self.db.query(
-            "SELECT * FROM experiences WHERE status = 'active'"
-        )
-        self._cache = {r['id']: r for r in rows}
-        self._corpus = []
-        for exp in self._cache.values():
-            text = f"{exp['title']} {exp['problem']} {exp['solution']} {' '.join(exp['keywords'])}"
-            self._corpus.append(self._tokenize(text))
-        self._bm25 = BM25Okapi(self._corpus)
-    
-    def _tokenize(self, text: str) -> list[str]:
-        """与当前实现保持一致的分词逻辑"""
-        text = text.lower()
-        tokens = re.findall(r'[a-z]+|[\u4e00-\u9fa5]+|\d+', text)
-        stopwords = {...}  # 停用词表
-        return [t for t in tokens if len(t) > 1 and t not in stopwords]
-    
-    def search(self, query: str, tech_stack: list[str] = None, 
+        self._model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+
+    def search(self, query: str, tech_stack: list[str] = None,
                top_k: int = 5) -> list[dict]:
-        """BM25 检索"""
-        # 标签过滤（SQL）
-        candidates = list(self._cache.values())
-        if tech_stack:
-            candidates = [c for c in candidates 
-                         if any(t in c['tech_stack'] for t in tech_stack)]
-        
-        # BM25 排序
-        query_tokens = self._tokenize(query)
-        scores = self._bm25.get_scores(query_tokens)
-        
-        # 组合结果并排序
-        results = []
-        for i, (exp, score) in enumerate(zip(candidates, scores)):
-            if score >= 0.1:  # threshold
-                exp['similarity'] = round(score, 3)
-                results.append((exp, score))
-        
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [r[0] for r in results[:top_k]]
+        query_vec = self._model.encode(query, normalize_embeddings=True)
+        candidates = self._load_candidates(tech_stack)
+        scores = [np.dot(query_vec, c["vector"]) for c in candidates]
+        results = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        return [r[0] for r in results[:top_k] if r[1] >= 0.5]
 ```
 
-### 5.3 缓存刷新策略
+### 5.2 缓存刷新策略
 
 | 触发条件 | 操作 |
 |----------|------|
-| Server 启动 | 全量加载 |
-| 经验审核通过 | 增量添加到缓存 |
-| 经验被编辑 | 更新对应条目 |
-| 定时任务 | 每 5 分钟全量刷新（兜底）|
+| Server 启动 | 全量加载向量 |
+| 经验审核通过 | 计算并存储向量 |
+| 经验被编辑 | 重新计算向量 |
+| 经验删除 | 同步清除向量 |
 
 ## 6. 改造任务清单
 
@@ -303,7 +258,7 @@ class ExperienceService:
 
 - [ ] 重构 `server.py` 支持 SSE transport
 - [ ] 实现 PostgreSQL 存储层（`storage_pg.py`）
-- [ ] 实现内存 BM25 检索服务
+- [ ] 实现内存 Embedding 向量检索服务
 - [ ] 添加用户身份识别（API Key）
 - [ ] Dockerfile 和 K8s 配置
 
@@ -362,7 +317,7 @@ class ExperienceService:
 | 指标 | 预估 | 说明 |
 |------|------|------|
 | 内存占用 | ~200MB | 10万条经验缓存 |
-| 检索延迟 | < 50ms | BM25 内存计算 |
+| 检索延迟 | < 50ms | Embedding 向量计算 |
 | 并发支持 | 100+ | K8s 水平扩展 |
 | 数据库连接 | 20 | 连接池配置 |
 

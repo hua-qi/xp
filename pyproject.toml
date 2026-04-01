@@ -1,14 +1,17 @@
 [project]
 name = "xp"
 version = "0.2.0"
-description = "Agent 最佳实践沉淀工具 - 纯文本标签 + BM25 检索"
+description = "Agent 最佳实践沉淀工具 - Embedding 向量检索"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "rank-bm25>=0.2.2",
     "python-dotenv>=1.0.0",
     "sentence-transformers>=2.2.0",
     "numpy>=1.24.0",
+    "asyncpg>=0.29.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "pgvector>=0.2.0",
 ]
 
 [project.scripts]

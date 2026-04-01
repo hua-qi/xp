@@ -218,6 +218,21 @@ class KnowledgeService:
         # 自动推断场景标签
         scene = self._infer_scene(all_text)
 
+        quality_score = self._compute_quality_score(
+            key_decisions=key_decisions,
+            solution_summary=solution_summary,
+            related_files=related_files,
+            tech_stack=tech_stack if tech_stack else tags,
+        )
+
+        if quality_score < 40:
+            raise ValueError(
+                f"经验质量评分过低（{quality_score}/100），提取已拒绝。"
+                f"请补充：key_decisions（当前{len(key_decisions.strip())}字，建议>=50字）"
+                f"，solution_summary（当前{len(solution_summary.strip())}字，建议>=50字）"
+                f"，相关文件路径，技术栈标签。"
+            )
+
         # Phase 3: 计算相关文件的 hash
         file_hashes = calculate_files_hashes(related_files)
 
@@ -251,7 +266,11 @@ class KnowledgeService:
 
 
         exp = self._store.add(exp)
-        
+
+        if quality_score >= 80:
+            exp.status = ExperienceStatus.ACTIVE
+            exp.confidence = 0.65
+
         # Phase 4: 生成向量并保存
         from .embeddings import get_provider
         from .storage import VectorStore
@@ -364,6 +383,73 @@ class KnowledgeService:
 
     async def record_session(self, session: Session):
         self._metrics.record_session(session)
+
+    async def finalize_task(
+        self,
+        session_id: str,
+        task_description: str,
+        solution_summary: str,
+        key_decisions: str,
+        final_response: str,
+        conversation_summary: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        related_files: Optional[list[str]] = None,
+        iteration_count: int = 1,
+        had_error_correction: bool = False,
+        user_accepted: bool = True,
+    ) -> dict:
+        result = {
+            "session_id": session_id,
+            "extract": {"status": "skipped", "id": None, "reason": None},
+            "session": {"status": "skipped"},
+            "adoption": {"status": "skipped", "results": []},
+        }
+
+        experience_id = None
+        try:
+            exp = await self.extract_experience(
+                task_description=task_description,
+                solution_summary=solution_summary,
+                key_decisions=key_decisions,
+                conversation_summary=conversation_summary,
+                tags=tags or [],
+                related_files=related_files or [],
+            )
+            experience_id = exp.id
+            result["extract"] = {"status": "ok", "id": exp.id, "reason": None}
+        except Exception as e:
+            result["extract"] = {"status": "skipped", "id": None, "reason": str(e)}
+
+        try:
+            session = Session(
+                session_id=session_id,
+                task_description=task_description,
+                experience_ids_injected=[experience_id] if experience_id else [],
+                iteration_count=iteration_count,
+                had_error_correction=had_error_correction,
+                user_accepted=user_accepted,
+                created_at=datetime.utcnow().isoformat(),
+                ab_test_group="treatment",
+                ab_test_result_shown=True,
+            )
+            await self.record_session(session)
+            result["session"] = {"status": "ok"}
+        except Exception as e:
+            result["session"] = {"status": "error", "reason": str(e)}
+
+        injected_ids = [experience_id] if experience_id else []
+        if injected_ids:
+            try:
+                adoption_results = await self.infer_adoption(
+                    session_id=session_id,
+                    final_response=final_response,
+                    experience_ids_injected=injected_ids,
+                )
+                result["adoption"] = {"status": "ok", "results": adoption_results}
+            except Exception as e:
+                result["adoption"] = {"status": "error", "reason": str(e)}
+
+        return result
 
     async def infer_adoption(
         self,
@@ -996,6 +1082,39 @@ class KnowledgeService:
 
     def _make_title(self, task: str) -> str:
         return task[:60] + ("..." if len(task) > 60 else "")
+
+    def _compute_quality_score(
+        self,
+        key_decisions: str,
+        solution_summary: str,
+        related_files: list[str],
+        tech_stack: list[str],
+        duplicate_similarity: float = 0.0,
+    ) -> int:
+        score = 0
+
+        kd_len = len(key_decisions.strip())
+        if kd_len >= 50:
+            score += 40
+        elif kd_len >= 20:
+            score += 20
+
+        ss_len = len(solution_summary.strip())
+        if ss_len >= 50:
+            score += 20
+        elif ss_len >= 20:
+            score += 10
+
+        if related_files:
+            score += 15
+
+        if tech_stack:
+            score += 15
+
+        if duplicate_similarity <= 0.6:
+            score += 10
+
+        return score
 
     def _parse_markdown_section(self, section: str) -> Optional[Experience]:
         lines = section.splitlines()

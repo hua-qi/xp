@@ -631,3 +631,15 @@ class MetricsStore:
             "ab_test_groups": ab_test_groups,
             "new_sessions_30d": new_sessions_30d,
         }
+
+
+def get_backend():
+    backend_type = os.environ.get("XP_BACKEND", "local")
+    if backend_type == "postgres":
+        dsn = os.environ.get("XP_POSTGRES_DSN", "")
+        if not dsn:
+            raise RuntimeError("XP_BACKEND=postgres 但未设置 XP_POSTGRES_DSN")
+        from .backends.postgres import PostgresBackend
+        return PostgresBackend(dsn)
+    from .backends.local import LocalBackend
+    return LocalBackend()
