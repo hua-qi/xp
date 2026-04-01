@@ -2,13 +2,12 @@
 
 import hashlib
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from .config import XP_HOME
 
-XP_HOME = Path(os.environ.get("XP_HOME", Path.home() / ".xp"))
 WATCH_STATE_FILE = XP_HOME / "watch_state.json"
 
 

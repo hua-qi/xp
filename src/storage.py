@@ -1,11 +1,11 @@
 import json
-import os
 import sqlite3
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .config import XP_HOME
 from .models import (
     Experience,
     ExperienceLevel,
@@ -18,7 +18,6 @@ from .models import (
     Session,
 )
 
-XP_HOME = Path(os.environ.get("XP_HOME", "/Users/lianzimeng/workspace/xp-data"))
 KNOWLEDGE_FILE = XP_HOME / "knowledge.json"
 METRICS_DB = XP_HOME / "metrics.db"
 

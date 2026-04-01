@@ -1,15 +1,14 @@
 """项目配置管理 (Phase 3)"""
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .config import XP_HOME
 from .models import ProjectConfig
 
 
-XP_HOME = Path(os.environ.get("XP_HOME", "/Users/lianzimeng/workspace/xp-data"))
 PROJECT_CONFIG_FILE = XP_HOME / "projects.json"
 CURRENT_PROJECT_FILE = XP_HOME / "current_project"
 
