@@ -417,43 +417,9 @@ class KnowledgeService:
         return True
 
     async def record_feedback(self, experience_id: str, adopted: bool, reason: Optional[str] = None) -> bool:
-        """记录经验反馈并更新 confidence
-        
-        Args:
-            experience_id: 经验 ID
-            adopted: 是否被采纳
-            reason: 未采纳原因（可选）
-            
-        Returns:
-            是否成功记录
-        """
-        exp = self._store.get(experience_id)
-        if not exp:
-            return False
-
-        # 记录反馈
-        feedback = Feedback(
-            experience_id=experience_id,
-            adopted=adopted,
-            reason=reason,
-        )
-        self._metrics.record_feedback(feedback)
-
-        # 获取最新统计
-        stats = self._metrics.get_experience_stats(experience_id)
-        if stats:
-            # 动态更新 confidence: 旧值 * 0.9 + 采纳率 * 0.1
-            new_confidence = exp.confidence * 0.9 + stats.adoption_rate * 0.1
-            exp.confidence = round(new_confidence, 3)
-
-            # confidence < 0.1 自动归档
-            if exp.confidence < 0.1:
-                exp.status = ExperienceStatus.ARCHIVED
-                exp.reject_reason = "Low adoption rate, auto archived"
-
-            self._store.update(exp)
-
-        return True
+        from .domain.feedback import FeedbackService
+        svc = FeedbackService(self._store, self._metrics)
+        return await svc.record_feedback(experience_id, adopted, reason)
 
     async def auto_activate_high_confidence(self, exp_id: str) -> bool:
         """高置信自动激活
