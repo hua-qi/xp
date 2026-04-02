@@ -37,7 +37,7 @@ async def backup_source(xp_home: Path) -> Path:
 
 
 async def migrate(dsn: str, xp_home: Path, dry_run: bool = False, batch_size: int = 100):
-    from src.backends.postgres import PostgresBackend
+    from src.infrastructure.backends.postgres import PostgresBackend
     from src.storage import ExperienceStore, VectorStore
     from src.models import ExperienceStatus
 

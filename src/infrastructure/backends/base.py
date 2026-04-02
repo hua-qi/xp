@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Optional
-from ..models import Experience, ExperienceStatus, Session, Feedback, ExperienceStats
+from ...models import Experience, ExperienceStatus, Session, Feedback, ExperienceStats
 
 
 class StorageBackend(ABC):

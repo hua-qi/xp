@@ -3,7 +3,7 @@ import pytest
 
 
 def test_storage_backend_is_abstract():
-    from src.backends.base import StorageBackend
+    from src.infrastructure.backends.base import StorageBackend
     import inspect
     assert inspect.isabstract(StorageBackend)
 
@@ -26,7 +26,7 @@ POSTGRES_DSN = os.environ.get("TEST_POSTGRES_DSN", "")
 
 @pytest.mark.skipif(not POSTGRES_DSN, reason="TEST_POSTGRES_DSN not set")
 async def test_postgres_backend_add_and_get(tmp_path):
-    from src.backends.postgres import PostgresBackend
+    from src.infrastructure.backends.postgres import PostgresBackend
     from src.models import (
         Experience, ExperienceType, ExperienceLevel,
         ExperienceStatus, ExperienceSource,

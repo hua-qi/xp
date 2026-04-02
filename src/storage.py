@@ -697,6 +697,6 @@ def get_backend():
         dsn = os.environ.get("XP_POSTGRES_DSN", "")
         if not dsn:
             raise RuntimeError("XP_BACKEND=postgres 但未设置 XP_POSTGRES_DSN")
-        from .backends.postgres import PostgresBackend
+        from .infrastructure.backends.postgres import PostgresBackend
         return PostgresBackend(dsn)
     return LocalBackend()
