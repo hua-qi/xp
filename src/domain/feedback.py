@@ -1,5 +1,16 @@
 from typing import Optional
-from src.models import Feedback, ExperienceStatus
+from ..models import Feedback, ExperienceStatus
+from .constants import (
+    CONFIDENCE_HELPFUL_DELTA,
+    CONFIDENCE_UNHELPFUL_DELTA,
+    CONFIDENCE_MIN,
+    CONFIDENCE_MAX,
+)
+
+
+def compute_new_confidence(current: float, helpful: bool) -> float:
+    delta = CONFIDENCE_HELPFUL_DELTA if helpful else CONFIDENCE_UNHELPFUL_DELTA
+    return round(max(CONFIDENCE_MIN, min(CONFIDENCE_MAX, current + delta)), 3)
 
 
 class FeedbackService:
