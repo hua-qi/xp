@@ -1,35 +1,34 @@
 import pytest
-from unittest.mock import MagicMock
 import numpy as np
+from src.embeddings import EmbeddingProvider, set_provider
+
+
+class FakeProvider(EmbeddingProvider):
+    def embed_texts(self, texts):
+        vecs = []
+        for _ in texts:
+            v = np.random.rand(64).astype(np.float32)
+            vecs.append((v / np.linalg.norm(v)).tolist())
+        return vecs
 
 
 @pytest.fixture
-def mock_extraction_deps(tmp_path, monkeypatch):
+def extraction_deps(tmp_path, monkeypatch):
     import src.storage as storage_mod
     monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
     monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
     monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
 
+    set_provider(FakeProvider())
+
     from src.storage import ExperienceStore, VectorStore
-    store = ExperienceStore()
-    v_store = VectorStore()
-
-    mock_provider = MagicMock()
-    vec = np.random.rand(384).astype(np.float32)
-    vec = vec / np.linalg.norm(vec)
-    mock_provider.embed_text.return_value = vec.tolist()
-    mock_provider.embed_texts.return_value = [vec.tolist()]
-
-    import src.embeddings as emb_mod
-    monkeypatch.setattr(emb_mod, "get_provider", lambda: mock_provider)
-
-    return store, v_store
+    return ExperienceStore(), VectorStore()
 
 
 class TestExtractionService:
-    async def test_valid_input_returns_experience(self, mock_extraction_deps):
+    async def test_valid_input_returns_experience(self, extraction_deps):
         from src.domain.extraction import ExtractionService
-        store, v_store = mock_extraction_deps
+        store, v_store = extraction_deps
         svc = ExtractionService(store, v_store)
 
         exp = await svc.extract(
@@ -42,9 +41,9 @@ class TestExtractionService:
         assert exp.id is not None
         assert exp.problem == "实现 React 防抖 Hook"
 
-    async def test_short_key_decisions_raises(self, mock_extraction_deps):
+    async def test_short_key_decisions_raises(self, extraction_deps):
         from src.domain.extraction import ExtractionService
-        store, v_store = mock_extraction_deps
+        store, v_store = extraction_deps
         svc = ExtractionService(store, v_store)
 
         with pytest.raises(ValueError, match="key_decisions"):

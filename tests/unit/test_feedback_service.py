@@ -1,14 +1,22 @@
 import pytest
 import uuid
 from datetime import datetime
-from unittest.mock import MagicMock
 from src.models import (
     Experience, ExperienceType, ExperienceLevel,
-    ExperienceStatus, ExperienceSource, ExperienceMetadata, ExperienceStats,
+    ExperienceStatus, ExperienceSource, ExperienceMetadata,
 )
+from src.domain.feedback import compute_new_confidence
+from src.domain.constants import (
+    CONFIDENCE_HELPFUL_DELTA,
+    CONFIDENCE_UNHELPFUL_DELTA,
+    AUTO_ARCHIVE_ADOPTION_THRESHOLD,
+)
+from tests.helpers.fake_uow import InMemoryUnitOfWork
+from src.application.handlers.feedback_handler import FeedbackHandler
+from src.application.commands import RecordFeedbackCommand
 
 
-def make_exp(confidence=0.6):
+def make_exp(confidence=0.6) -> Experience:
     return Experience(
         id=str(uuid.uuid4()),
         type=ExperienceType.FEATURE,
@@ -23,48 +31,32 @@ def make_exp(confidence=0.6):
 
 
 class TestFeedbackService:
-    async def test_returns_false_for_nonexistent(self):
-        from src.domain.feedback import FeedbackService
-        mock_store = MagicMock()
-        mock_store.get.return_value = None
-        mock_metrics = MagicMock()
-        svc = FeedbackService(mock_store, mock_metrics)
-        result = await svc.record_feedback("nonexistent", adopted=True)
+    def test_returns_false_for_nonexistent(self):
+        uow = InMemoryUnitOfWork()
+        handler = FeedbackHandler(lambda: uow)
+        result = handler.handle_feedback(
+            RecordFeedbackCommand(experience_id="nonexistent", helpful=True)
+        )
         assert result is False
 
-    async def test_adopted_true_increases_confidence(self):
-        from src.domain.feedback import FeedbackService
+    def test_adopted_true_increases_confidence(self):
         exp = make_exp(confidence=0.6)
-        mock_store = MagicMock()
-        mock_store.get.return_value = exp
-        mock_metrics = MagicMock()
-        stats = ExperienceStats(
-            experience_id=exp.id,
-            hit_count=1, adopted_count=1, rejected_count=0,
-            adoption_rate=1.0,
-        )
-        mock_metrics.get_experience_stats.return_value = stats
-        svc = FeedbackService(mock_store, mock_metrics)
+        uow = InMemoryUnitOfWork()
+        uow.experiences._committed[exp.id] = exp
 
-        await svc.record_feedback(exp.id, adopted=True)
-        mock_store.update.assert_called_once()
-        updated_exp = mock_store.update.call_args[0][0]
-        assert updated_exp.confidence > 0.6
+        handler = FeedbackHandler(lambda: uow)
+        handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=True))
 
-    async def test_low_confidence_auto_archives(self):
-        from src.domain.feedback import FeedbackService
-        exp = make_exp(confidence=0.05)
-        mock_store = MagicMock()
-        mock_store.get.return_value = exp
-        mock_metrics = MagicMock()
-        stats = ExperienceStats(
-            experience_id=exp.id,
-            hit_count=10, adopted_count=0, rejected_count=10,
-            adoption_rate=0.0,
-        )
-        mock_metrics.get_experience_stats.return_value = stats
-        svc = FeedbackService(mock_store, mock_metrics)
+        updated = uow.experiences.get(exp.id)
+        assert updated.confidence == round(0.6 + CONFIDENCE_HELPFUL_DELTA, 3)
 
-        await svc.record_feedback(exp.id, adopted=False)
-        updated_exp = mock_store.update.call_args[0][0]
-        assert updated_exp.status == ExperienceStatus.ARCHIVED
+    def test_low_confidence_auto_archives(self):
+        exp = make_exp(confidence=AUTO_ARCHIVE_ADOPTION_THRESHOLD)
+        uow = InMemoryUnitOfWork()
+        uow.experiences._committed[exp.id] = exp
+
+        handler = FeedbackHandler(lambda: uow)
+        handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=False))
+
+        updated = uow.experiences.get(exp.id)
+        assert updated.status == ExperienceStatus.ARCHIVED

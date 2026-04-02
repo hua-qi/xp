@@ -2,19 +2,22 @@ import json
 import uuid
 from datetime import datetime
 import pytest
-from unittest.mock import MagicMock
 import numpy as np
+from src.embeddings import EmbeddingProvider, set_provider
+
+
+class _FakeProvider(EmbeddingProvider):
+    def embed_texts(self, texts):
+        vecs = []
+        for _ in texts:
+            v = np.random.rand(64).astype(np.float32)
+            vecs.append((v / np.linalg.norm(v)).tolist())
+        return vecs
 
 
 @pytest.fixture(autouse=True)
-def mock_embedding(monkeypatch):
-    import src.embeddings as emb_mod
-    mock_provider = MagicMock()
-    vec = np.random.rand(384).astype(np.float32)
-    vec = vec / np.linalg.norm(vec)
-    mock_provider.embed_text.return_value = vec.tolist()
-    mock_provider.embed_texts.return_value = [vec.tolist()]
-    monkeypatch.setattr(emb_mod, "get_provider", lambda: mock_provider)
+def fake_embedding():
+    set_provider(_FakeProvider())
 
 
 def make_legacy_knowledge_json(tmp_path):

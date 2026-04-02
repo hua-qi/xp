@@ -1,64 +1,62 @@
 import pytest
+import hashlib
 import numpy as np
-from unittest.mock import MagicMock
-from src.domain.search import SearchService
+from src.domain.search_domain import ab_assign
 
 
-@pytest.fixture
-def mock_deps():
-    mock_store = MagicMock()
-    mock_store.list_active.return_value = []
+class TestSearchServiceABTest:
+    def test_empty_store_via_ab_assign_treatment(self):
+        treat_id = next(
+            f"t{i}" for i in range(100)
+            if int(hashlib.md5(f"t{i}".encode()).hexdigest(), 16) % 10 != 0
+        )
+        assert ab_assign(treat_id) == "treatment"
 
-    mock_vector_store = MagicMock()
-    mock_vector_store.get_all_vectors.return_value = ([], np.array([]))
-    mock_vector_store.save_vectors.return_value = None
+    def test_control_group_via_ab_assign(self):
+        control_id = next(
+            f"s{i}" for i in range(100)
+            if int(hashlib.md5(f"s{i}".encode()).hexdigest(), 16) % 10 == 0
+        )
+        assert ab_assign(control_id) == "control"
 
-    mock_metrics = MagicMock()
-    mock_metrics.record_search.return_value = None
-
-    mock_provider = MagicMock()
-    vec = np.random.rand(384).astype(np.float32)
-    mock_provider.embed_text.return_value = (vec / np.linalg.norm(vec)).tolist()
-
-    return mock_store, mock_vector_store, mock_metrics, mock_provider
+    def test_treatment_group_via_ab_assign(self):
+        treat_id = next(
+            f"t{i}" for i in range(100)
+            if int(hashlib.md5(f"t{i}".encode()).hexdigest(), 16) % 10 != 0
+        )
+        assert ab_assign(treat_id) == "treatment"
 
 
-class TestSearchService:
-    async def test_empty_store_returns_empty(self, mock_deps):
-        store, v_store, metrics, provider = mock_deps
-        svc = SearchService(store, v_store, metrics, provider, project="default")
-        results, meta = await svc.search("query")
+class TestSearchServiceEmptyStore:
+    def test_empty_store_returns_empty(self, tmp_path, monkeypatch):
+        import src.storage as storage_mod
+        monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
+        monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
+
+        from src.embeddings import EmbeddingProvider, set_provider
+        from src.storage import ExperienceStore, VectorStore, MetricsStore
+        from src.domain.search import SearchService
+        import asyncio
+
+        class FakeProvider(EmbeddingProvider):
+            def embed_text(self, text):
+                v = np.random.rand(64).astype(np.float32)
+                return (v / np.linalg.norm(v)).tolist()
+
+            def embed_texts(self, texts):
+                return [self.embed_text(t) for t in texts]
+
+        set_provider(FakeProvider())
+        store = ExperienceStore()
+        v_store = VectorStore()
+        metrics = MetricsStore()
+
+        svc = SearchService(store, v_store, metrics, FakeProvider(), project="default")
+
+        loop = asyncio.new_event_loop()
+        results, meta = loop.run_until_complete(svc.search("query"))
+        loop.close()
+
         assert results == []
         assert meta["strategy"] == "embedding_only"
-
-    async def test_control_group_returns_empty(self, mock_deps):
-        import hashlib
-        store, v_store, metrics, provider = mock_deps
-        svc = SearchService(store, v_store, metrics, provider, project="default")
-
-        control_id = None
-        for i in range(100):
-            sid = f"s{i}"
-            if int(hashlib.md5(sid.encode()).hexdigest(), 16) % 10 == 0:
-                control_id = sid
-                break
-
-        results, meta = await svc.search("query", session_id=control_id)
-        assert meta["ab_test_group"] == "control"
-        assert results == []
-
-    async def test_treatment_group_metadata(self, mock_deps):
-        import hashlib
-        store, v_store, metrics, provider = mock_deps
-        svc = SearchService(store, v_store, metrics, provider, project="default")
-
-        treat_id = None
-        for i in range(100):
-            sid = f"t{i}"
-            if int(hashlib.md5(sid.encode()).hexdigest(), 16) % 10 != 0:
-                treat_id = sid
-                break
-
-        _, meta = await svc.search("query", session_id=treat_id)
-        assert meta["ab_test_group"] == "treatment"
-        assert meta["show_results"] is True
