@@ -3,8 +3,8 @@ from datetime import datetime
 from typing import Optional
 import numpy as np
 
-from src.models import Experience
-from src.file_watcher import TTLManager
+from ..models import Experience
+from ..file_watcher import TTLManager
 
 
 class SearchService:
@@ -59,7 +59,7 @@ class SearchService:
             self._metrics.record_search(query, 0)
             return [], {"ab_test_group": ab_test_group, "show_results": show_results, "strategy": "embedding_only"}
 
-        from src.embeddings import cosine_similarity
+        from ..embeddings import cosine_similarity
 
         query_vec = np.array(self._provider.embed_text(query), dtype=np.float32)
         candidate_ids = [e.id for e in valid_candidates]

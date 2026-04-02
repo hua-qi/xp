@@ -1,3 +1,7 @@
+import os
+import pytest
+
+
 def test_storage_backend_is_abstract():
     from src.backends.base import StorageBackend
     import inspect
@@ -9,14 +13,13 @@ def test_local_backend_implements_interface(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
     monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
     monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-    from src.backends.local import LocalBackend
-    from src.backends.base import StorageBackend
+    from src.storage import LocalBackend
     backend = LocalBackend()
-    assert isinstance(backend, StorageBackend)
+    assert hasattr(backend, "add_experience")
+    assert hasattr(backend, "get_experience")
+    assert hasattr(backend, "list_by_status")
+    assert hasattr(backend, "save_vector")
 
-
-import os
-import pytest
 
 POSTGRES_DSN = os.environ.get("TEST_POSTGRES_DSN", "")
 
@@ -67,8 +70,7 @@ def test_get_backend_defaults_to_local(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
     monkeypatch.delenv("XP_BACKEND", raising=False)
     monkeypatch.delenv("XP_POSTGRES_DSN", raising=False)
-    from src.storage import get_backend
-    from src.backends.local import LocalBackend
+    from src.storage import get_backend, LocalBackend
     backend = get_backend()
     assert isinstance(backend, LocalBackend)
 

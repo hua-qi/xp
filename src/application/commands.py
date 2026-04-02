@@ -48,3 +48,62 @@ class CreateProjectCommand:
 @dataclass
 class StartSessionCommand:
     project_id: str | None = None
+
+
+@dataclass
+class SearchCommand:
+    query: str
+    tags: list[str] | None = None
+    top_k: int = 3
+    session_id: str | None = None
+    project_id: str | None = None
+
+
+@dataclass
+class RecordSessionCommand:
+    session_id: str
+    task_description: str
+    experience_ids_injected: list[str] = field(default_factory=list)
+    iteration_count: int = 1
+    had_error_correction: bool = False
+    user_accepted: bool = True
+    ab_test_group: str = "treatment"
+    ab_test_result_shown: bool = True
+
+
+@dataclass
+class GetStatsCommand:
+    since_days: int | None = None
+
+
+@dataclass
+class InferAdoptionCommand:
+    session_id: str
+    final_response: str
+    experience_ids_injected: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ExtractExperienceCommand:
+    task_description: str
+    solution_summary: str
+    key_decisions: str
+    conversation_summary: str | None = None
+    tags: list[str] = field(default_factory=list)
+    related_files: list[str] = field(default_factory=list)
+    project_id: str | None = None
+
+
+@dataclass
+class ListExperiencesCommand:
+    status: str = "pending"
+
+
+@dataclass
+class DeleteExperienceCommand:
+    prefix: str
+
+
+@dataclass
+class GetExperienceCommand:
+    experience_id: str

@@ -18,16 +18,19 @@ if sys.platform == "darwin" or sys.platform.startswith("linux"):
     readline.parse_and_bind("set convert-meta off")
 
 
-def _get_service(project: str = None):
-    from .knowledge import KnowledgeService
+def _get_bus(project: str = None):
+    from .container import build_command_bus
     from .project_config import ProjectManager
-    from .storage import ExperienceStore, MetricsStore
 
     if project is None:
-        # 获取当前项目
         project = ProjectManager().get_current()
 
-    return KnowledgeService(ExperienceStore(), MetricsStore(), project)
+    return build_command_bus(project=project)
+
+
+def _get_project() -> str:
+    from .project_config import ProjectManager
+    return ProjectManager().get_current()
 
 
 def cmd_add(args):
@@ -57,19 +60,16 @@ def cmd_add(args):
     files_input = input("相关文件路径 (逗号分隔，可选): ").strip()
     related_files = [f.strip() for f in files_input.split(",") if f.strip()] if files_input else []
 
-    service = _get_service()
+    from .application.commands import ExtractExperienceCommand
+    bus = _get_bus()
 
-    async def run():
-        exp = await service.extract_experience(
-            task_description=task_description,
-            solution_summary=solution_summary,
-            key_decisions=key_decisions,
-            tags=tags,
-            related_files=related_files,
-        )
-        return exp
-
-    exp = asyncio.run(run())
+    exp = bus.dispatch(ExtractExperienceCommand(
+        task_description=task_description,
+        solution_summary=solution_summary,
+        key_decisions=key_decisions,
+        tags=tags,
+        related_files=related_files,
+    ))
 
     print(f"\n✓ 经验已添加 (状态: pending)")
     print(f"  ID: {exp.id}")
@@ -134,17 +134,28 @@ def cmd_review(args):
                 editor = os.environ.get("EDITOR", "vi")
                 subprocess.call([editor, tmp_path_name])
                 content = open(tmp_path_name, encoding="utf-8").read()
+                os.unlink(tmp_path_name)
                 lines = content.splitlines()
-                if lines:
-                    exp.title = lines[0].lstrip("# ").strip() or exp.title
-                exp.status = ExperienceStatus.ACTIVE
-                exp.confidence = 1.0
-                store.update(exp)
+                new_title = lines[0].lstrip("# ").strip() if lines else ""
                 import asyncio as _asyncio
-                from src.knowledge import KnowledgeService
-                from src.storage import MetricsStore as _MetricsStore
-                svc = KnowledgeService(store, _MetricsStore())
-                _asyncio.run(svc.edit_and_confirm(exp.id))
+                from .domain.extraction import ExtractionService
+                from .storage import ExperienceStore as _ExpStore, VectorStore as _VStore
+                from .embeddings import get_provider as _get_provider
+                _svc_store = _ExpStore()
+                _exp2 = _svc_store.get(exp.id)
+                if _exp2:
+                    if new_title:
+                        _exp2.title = new_title
+                    _exp2.status = ExperienceStatus.ACTIVE
+                    _exp2.confidence = 1.0
+                    _svc_store.update(_exp2)
+                    try:
+                        _provider = _get_provider()
+                        _text = f"{_exp2.title}\n{_exp2.problem}\n{_exp2.key_decisions}"
+                        _vec = _provider.embed_text(_text)
+                        _VStore().save_vector(_exp2.id, _vec)
+                    except Exception:
+                        pass
                 metrics.record_review(exp.id, "confirmed")
                 print("  已编辑并确认，confidence = 1.0。")
                 break
@@ -192,13 +203,70 @@ def cmd_import(args):
         sys.exit(1)
 
     content = file_path.read_text(encoding="utf-8")
-    service = _get_service()
 
-    async def run():
-        imported = await service.import_from_markdown(content)
-        return imported
+    from .storage import ExperienceStore, MetricsStore
+    from .models import Experience, ExperienceStatus, ExperienceSource, ExperienceMetadata, ExperienceType, ExperienceLevel
+    from .domain.metadata import infer_tech_stack, infer_scene, infer_type, infer_level
+    import uuid
+    from datetime import datetime
 
-    imported = asyncio.run(run())
+    def _parse_section(section: str):
+        lines = section.splitlines()
+        if not lines:
+            return None
+        title = lines[0].lstrip("#").strip()
+        if not title:
+            return None
+        problem = ""
+        solution = ""
+        tags_list: list[str] = []
+        current_key = None
+        for line in lines[1:]:
+            lower = line.lower().strip()
+            if lower.startswith("**问题**") or lower.startswith("**problem**"):
+                current_key = "problem"
+            elif lower.startswith("**解决方案**") or lower.startswith("**solution**"):
+                current_key = "solution"
+            elif lower.startswith("**标签**") or lower.startswith("**tags**"):
+                tag_part = line.split(":", 1)[-1].strip()
+                tags_list = [t.strip() for t in tag_part.replace("，", ",").split(",") if t.strip()]
+                current_key = None
+            elif current_key == "problem":
+                problem += line + "\n"
+            elif current_key == "solution":
+                solution += line + "\n"
+        if not problem:
+            problem = title
+        if not solution:
+            return None
+        all_text = f"{title}\n{problem}\n{solution}"
+        tech_stack = infer_tech_stack(all_text)
+        scene = infer_scene(all_text)
+        return Experience(
+            id=str(uuid.uuid4()),
+            type=infer_type(title, problem),
+            level=infer_level(title, problem),
+            title=title,
+            tags=tags_list,
+            problem=problem.strip(),
+            solution=solution.strip(),
+            confidence=1.0,
+            status=ExperienceStatus.PENDING,
+            source=ExperienceSource.MANUAL,
+            created_at=datetime.utcnow().isoformat(),
+            metadata=ExperienceMetadata(
+                tech_stack=tech_stack if tech_stack else tags_list,
+                problem_type=infer_type(title, problem).value,
+                scene=scene,
+            ),
+        )
+
+    store = ExperienceStore()
+    imported = []
+    for section in content.strip().split("\n---\n"):
+        exp = _parse_section(section.strip())
+        if exp:
+            imported.append(store.add(exp))
     print(f"已导入 {len(imported)} 条经验（状态: pending，请运行 `xp review` 确认）")
     for exp in imported:
         print(f"  - [{exp.type.value}] {exp.title}")
@@ -214,8 +282,9 @@ def cmd_stats(args):
             except ValueError:
                 pass
 
-    service = _get_service()
-    stats = service.get_stats(since_days)
+    from .application.commands import GetStatsCommand
+    bus = _get_bus()
+    stats = bus.dispatch(GetStatsCommand(since_days=since_days))
 
     period = f"最近 {since_days} 天" if since_days else "全部时间"
 
@@ -282,13 +351,9 @@ def cmd_stats(args):
 
 
 def cmd_analyze(args):
-    service = _get_service()
-
-    async def run():
-        report = await service.analyze_quality()
-        return report
-
-    report = asyncio.run(run())
+    from .application.commands import AnalyzeQualityCommand
+    bus = _get_bus()
+    report = bus.dispatch(AnalyzeQualityCommand())
 
     print(f"\n{'=' * 60}")
     print(f"  XP 经验质量分析报告")
@@ -364,11 +429,12 @@ def cmd_show(args):
         print("用法: xp show <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    service = _get_service()
+    from .storage import ExperienceStore
     from .models import ExperienceStatus
+    store = ExperienceStore()
     all_exps = []
     for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-        all_exps.extend(service._store.list_by_status(status))
+        all_exps.extend(store.list_by_status(status))
     matches = [e for e in all_exps if e.id.startswith(prefix)]
     if len(matches) == 0:
         print(f"未找到匹配 '{prefix}' 的经验")
@@ -403,11 +469,12 @@ def cmd_edit(args):
         print("用法: xp edit <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    service = _get_service()
+    from .storage import ExperienceStore
+    store = ExperienceStore()
     all_exps = []
     from .models import ExperienceStatus
     for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-        all_exps.extend(service._store.list_by_status(status))
+        all_exps.extend(store.list_by_status(status))
     matches = [e for e in all_exps if e.id.startswith(prefix)]
     if len(matches) != 1:
         print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
@@ -448,7 +515,7 @@ def cmd_edit(args):
         print("\n已取消编辑")
         return
 
-    service._store.update(exp)
+    store.update(exp)
     print(f"\n已保存: [{exp.id[:8]}] {exp.title}  (状态: {exp.status.value})")
 
 
@@ -457,11 +524,20 @@ def cmd_archive(args):
         print("用法: xp archive <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    service = _get_service()
-    exp = service.archive_experience(prefix)
-    if exp is None:
+    from .application.commands import ArchiveExperienceCommand, DeleteExperienceCommand
+    from .storage import ExperienceStore
+    from .models import ExperienceStatus
+    store = ExperienceStore()
+    all_exps = []
+    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
+        all_exps.extend(store.list_by_status(status))
+    matches = [e for e in all_exps if e.id.startswith(prefix)]
+    if len(matches) != 1:
         print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
         sys.exit(1)
+    exp = matches[0]
+    exp.status = ExperienceStatus.ARCHIVED
+    store.update(exp)
     print(f"已归档: [{exp.id[:8]}] {exp.title}")
 
 
@@ -470,8 +546,9 @@ def cmd_delete(args):
         print("用法: xp delete <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    service = _get_service()
-    exp_id = service.delete_experience(prefix)
+    from .application.commands import DeleteExperienceCommand
+    bus = _get_bus()
+    exp_id = bus.dispatch(DeleteExperienceCommand(prefix=prefix))
     if exp_id is None:
         print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
         sys.exit(1)
@@ -489,10 +566,11 @@ def cmd_init(args):
 
     tags = [t.strip() for t in parsed.tags.split(",") if t.strip()] if parsed.tags else []
 
-    service = _get_service()
+    from .project_config import ProjectManager
+    pm = ProjectManager()
     try:
-        config = service.create_project(parsed.project, tags, parsed.root)
-        service.switch_project(parsed.project)
+        config = pm.create(parsed.project, tags, parsed.root)
+        pm.set_current(parsed.project)
         print(f"\n项目 '{parsed.project}' 创建成功！")
         print(f"  技术栈: {', '.join(config.tags) if config.tags else '无'}")
         print(f"  根目录: {config.root_path or '未设置'}")
@@ -503,29 +581,30 @@ def cmd_init(args):
 
 
 def cmd_project(args):
-    """项目管理"""
-    service = _get_service()
+    from .project_config import ProjectManager
+    pm = ProjectManager()
 
     if not args:
-        # 显示当前项目
-        current = service.current_project
+        current = pm.get_current()
         print(f"\n当前项目: {current}")
-        config = service.get_current_project_config()
+        config = pm.get(current)
         if config:
             print(f"  技术栈: {', '.join(config.tags) if config.tags else '无'}")
             print(f"  云端同步: {'已启用' if config.cloud_sync_enabled else '未启用'}")
         return
 
     if args[0] == "list":
-        projects = service.list_projects()
-        current = service.current_project
+        projects = pm.list()
+        current = pm.get_current()
         print(f"\n项目列表:")
         for p in projects:
             marker = " *" if p.name == current else ""
             print(f"  {p.name}{marker}")
             print(f"    标签: {', '.join(p.tags) if p.tags else '无'}")
     elif args[0] == "switch" and len(args) > 1:
-        if service.switch_project(args[1]):
+        all_names = [p.name for p in pm.list()]
+        if args[1] in all_names:
+            pm.set_current(args[1])
             print(f"已切换到项目 '{args[1]}'")
         else:
             print(f"项目 '{args[1]}' 不存在")
@@ -535,19 +614,29 @@ def cmd_project(args):
 
 
 def cmd_watch(args):
-    """文件监听和失效检测"""
-    service = _get_service()
+    from .storage import ExperienceStore, MetricsStore
+    from .file_watcher import FileWatcher, TTLManager, calculate_files_hashes
+    from .models import ExperienceStatus
+    from .project_config import ProjectManager
 
-    async def run():
-        # 检查失效经验
-        stale_list = await service.check_stale_experiences()
+    project = ProjectManager().get_current()
+    store = ExperienceStore()
+    file_watcher = FileWatcher()
+    ttl_manager = TTLManager()
 
-        # 运行 TTL 检查
-        expired = await service.run_ttl_check()
+    all_active = store.list_active()
+    project_exps = [e for e in all_active if e.project == project]
 
-        return stale_list, expired
+    stale_list = file_watcher.run_check(project_exps)
+    for exp, changed_files in stale_list:
+        exp.stale_reason = f"Files changed: {', '.join(changed_files)}"
+        store.update(exp)
 
-    stale_list, expired = asyncio.run(run())
+    expired = ttl_manager.check_experiences(project_exps)
+    for exp in expired:
+        exp.status = ExperienceStatus.ARCHIVED
+        exp.reject_reason = "TTL expired (90 days no hit)"
+        store.update(exp)
 
     print(f"\n{'=' * 60}")
     print(f"  XP 失效检测报告")
@@ -575,60 +664,26 @@ def cmd_watch(args):
 
 
 def cmd_sync(args):
-    """云端同步"""
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("direction", choices=["up", "down"], help="同步方向")
-    parser.add_argument("--provider", choices=["supabase", "weaviate", "elasticsearch"], help="云端Provider")
-    parsed = parser.parse_args(args)
-
-    service = _get_service()
-    config = service.get_current_project_config()
-
-    async def run():
-        if parsed.provider:
-            # 启用云端同步
-            print(f"正在连接到 {parsed.provider}...")
-            # 这里需要从配置或交互式输入获取连接参数
-            print("请先在项目配置中设置云端同步参数")
-            return
-
-        if parsed.direction == "up":
-            print("正在同步到云端...")
-            result = await service.sync_to_cloud()
-            if "error" in result:
-                print(f"错误: {result['error']}")
-            else:
-                print(f"同步完成: {result.get('success', 0)} 成功, {result.get('failed', 0)} 失败")
-        else:
-            print("正在从云端同步...")
-            result = await service.sync_from_cloud()
-            if "error" in result:
-                print(f"错误: {result['error']}")
-            else:
-                print(f"同步完成: {result.get('new', 0)} 新增, {result.get('merged', 0)} 更新")
-
-    asyncio.run(run())
+    print("云端同步已移除。请使用 REST API 进行团队共享。")
 
 
 def cmd_migrate(args):
     force = "--force" in args
 
     async def run():
-        from .knowledge import KnowledgeService
         from .project_config import ProjectManager
         from .storage import ExperienceStore, MetricsStore
         from .embeddings import get_provider
         from .storage import VectorStore
         from .models import ExperienceStatus
 
-        service = KnowledgeService(ExperienceStore(), MetricsStore(), ProjectManager().get_current())
+        store = ExperienceStore()
         provider = get_provider()
         v_store = VectorStore()
 
         all_exps = []
         for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-            all_exps.extend(service._store.list_by_status(status))
+            all_exps.extend(store.list_by_status(status))
 
         print(f"总经验数量: {len(all_exps)}")
 

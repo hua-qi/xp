@@ -497,6 +497,25 @@ class MetricsStore:
             for r in rows
         ]
 
+    def get_review_reject_reasons(self, limit: int = 10) -> dict[str, int]:
+        conn = _get_metrics_conn()
+        rows = conn.execute(
+            """SELECT reject_reason, COUNT(*) as cnt FROM review_events
+               WHERE action = 'rejected' AND reject_reason IS NOT NULL
+               GROUP BY reject_reason ORDER BY cnt DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return {r["reject_reason"]: r["cnt"] for r in rows}
+
+    def get_hitted_experience_ids(self) -> list[str]:
+        conn = _get_metrics_conn()
+        rows = conn.execute(
+            "SELECT experience_id FROM experience_stats WHERE hit_count > 0"
+        ).fetchall()
+        conn.close()
+        return [r["experience_id"] for r in rows]
+
     def get_stats(self, since_days: Optional[int] = None) -> dict:
         conn = _get_metrics_conn()
         date_filter = ""
@@ -633,6 +652,45 @@ class MetricsStore:
         }
 
 
+class LocalBackend:
+    """本地存储后端，实现 StorageBackend 接口"""
+
+    def __init__(self):
+        self._exp_store = ExperienceStore()
+        self._metrics = MetricsStore()
+        self._vectors = VectorStore()
+
+    def add_experience(self, exp: Experience) -> Experience:
+        return self._exp_store.add(exp)
+
+    def get_experience(self, exp_id: str) -> Optional[Experience]:
+        return self._exp_store.get(exp_id)
+
+    def update_experience(self, exp: Experience) -> bool:
+        return self._exp_store.update(exp)
+
+    def delete_experience(self, exp_id: str) -> bool:
+        return self._exp_store.delete(exp_id)
+
+    def list_by_status(self, status: ExperienceStatus) -> list[Experience]:
+        return self._exp_store.list_by_status(status)
+
+    def record_session(self, session: Session):
+        self._metrics.record_session(session)
+
+    def record_feedback(self, feedback: Feedback):
+        self._metrics.record_feedback(feedback)
+
+    def get_experience_stats(self, exp_id: str) -> Optional[ExperienceStats]:
+        return self._metrics.get_experience_stats(exp_id)
+
+    def save_vector(self, exp_id: str, vector: list[float]):
+        self._vectors.save_vector(exp_id, vector)
+
+    def get_all_vectors(self, exp_ids: Optional[list[str]] = None) -> tuple[list[str], "np.ndarray"]:
+        return self._vectors.get_all_vectors(exp_ids)
+
+
 def get_backend():
     backend_type = os.environ.get("XP_BACKEND", "local")
     if backend_type == "postgres":
@@ -641,5 +699,4 @@ def get_backend():
             raise RuntimeError("XP_BACKEND=postgres 但未设置 XP_POSTGRES_DSN")
         from .backends.postgres import PostgresBackend
         return PostgresBackend(dsn)
-    from .backends.local import LocalBackend
     return LocalBackend()

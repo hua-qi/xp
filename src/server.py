@@ -9,7 +9,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .knowledge import KnowledgeService
+from .container import build_command_bus
 from .models import Session
 from .storage import ExperienceStore, MetricsStore
 
@@ -17,13 +17,13 @@ load_dotenv()
 
 app = Server("xp")
 
-_service: KnowledgeService | None = None
+_bus = None
 
 
-def get_service() -> KnowledgeService:
-    if _service is None:
+def get_bus():
+    if _bus is None:
         raise RuntimeError("Service not initialized")
-    return _service
+    return _bus
 
 
 @app.list_tools()
@@ -286,17 +286,21 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    service = get_service()
+    from .application.commands import (
+        ExtractExperienceCommand, SearchCommand, RecordSessionCommand,
+        RecordFeedbackCommand, InferAdoptionCommand,
+    )
+    bus = get_bus()
 
     if name == "extract_experience":
-        exp = await service.extract_experience(
+        exp = bus.dispatch(ExtractExperienceCommand(
             task_description=arguments["task_description"],
             solution_summary=arguments["solution_summary"],
             key_decisions=arguments["key_decisions"],
             conversation_summary=arguments.get("conversation_summary"),
             tags=arguments.get("tags", []),
             related_files=arguments.get("related_files", []),
-        )
+        ))
         return [TextContent(
             type="text",
             text=json.dumps({
@@ -317,12 +321,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )]
 
     elif name == "search_best_practices":
-        results, meta = await service.search(
+        results, meta = bus.dispatch(SearchCommand(
             query=arguments["query"],
             tags=arguments.get("tags"),
             top_k=arguments.get("top_k", 3),
             session_id=arguments.get("session_id"),
-        )
+        ))
         if not results:
             return [TextContent(
                 type="text",
@@ -351,29 +355,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps({"ab_test_group": meta.get("ab_test_group", "treatment"), "result_shown": bool(meta.get("show_results", True)), "results": data}, ensure_ascii=False, indent=2))]
 
     elif name == "record_session":
-        session = Session(
+        bus.dispatch(RecordSessionCommand(
             session_id=arguments["session_id"],
             task_description=arguments["task_description"],
             experience_ids_injected=arguments["experience_ids_injected"],
             iteration_count=arguments["iteration_count"],
             had_error_correction=arguments["had_error_correction"],
             user_accepted=arguments["user_accepted"],
-            created_at=datetime.utcnow().isoformat(),
             ab_test_group=arguments.get("ab_test_group", "treatment"),
             ab_test_result_shown=arguments.get("result_shown", True),
-        )
-        await service.record_session(session)
+        ))
         return [TextContent(
             type="text",
-            text=json.dumps({"status": "recorded", "session_id": session.session_id}, ensure_ascii=False),
+            text=json.dumps({"status": "recorded", "session_id": arguments["session_id"]}, ensure_ascii=False),
         )]
 
     elif name == "record_feedback":
-        success = await service.record_feedback(
+        success = bus.dispatch(RecordFeedbackCommand(
             experience_id=arguments["experience_id"],
-            adopted=arguments["adopted"],
-            reason=arguments.get("reason"),
-        )
+            helpful=arguments["adopted"],
+        ))
         if success:
             return [TextContent(
                 type="text",
@@ -394,11 +395,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             )]
 
     elif name == "infer_adoption":
-        results = await service.infer_adoption(
+        results = bus.dispatch(InferAdoptionCommand(
             session_id=arguments["session_id"],
             final_response=arguments["final_response"],
             experience_ids_injected=arguments["experience_ids_injected"],
-        )
+        ))
         return [TextContent(
             type="text",
             text=json.dumps({
@@ -410,19 +411,50 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )]
 
     elif name == "finalize_task":
-        result = await service.finalize_task(
-            session_id=arguments["session_id"],
-            task_description=arguments["task_description"],
-            solution_summary=arguments["solution_summary"],
-            key_decisions=arguments["key_decisions"],
-            final_response=arguments["final_response"],
-            conversation_summary=arguments.get("conversation_summary"),
-            tags=arguments.get("tags", []),
-            related_files=arguments.get("related_files", []),
-            iteration_count=arguments.get("iteration_count", 1),
-            had_error_correction=arguments.get("had_error_correction", False),
-            user_accepted=arguments.get("user_accepted", True),
-        )
+        extract_result = {"status": "skipped", "id": None, "reason": None}
+        session_result = {"status": "skipped"}
+        adoption_result = {"status": "skipped", "results": []}
+
+        experience_id = None
+        try:
+            exp = bus.dispatch(ExtractExperienceCommand(
+                task_description=arguments["task_description"],
+                solution_summary=arguments["solution_summary"],
+                key_decisions=arguments["key_decisions"],
+                conversation_summary=arguments.get("conversation_summary"),
+                tags=arguments.get("tags", []),
+                related_files=arguments.get("related_files", []),
+            ))
+            experience_id = exp.id
+            extract_result = {"status": "ok", "id": exp.id, "reason": None}
+        except Exception as e:
+            extract_result = {"status": "skipped", "id": None, "reason": str(e)}
+
+        try:
+            bus.dispatch(RecordSessionCommand(
+                session_id=arguments["session_id"],
+                task_description=arguments["task_description"],
+                experience_ids_injected=[experience_id] if experience_id else [],
+                iteration_count=arguments.get("iteration_count", 1),
+                had_error_correction=arguments.get("had_error_correction", False),
+                user_accepted=arguments.get("user_accepted", True),
+            ))
+            session_result = {"status": "ok"}
+        except Exception as e:
+            session_result = {"status": "error", "reason": str(e)}
+
+        if experience_id:
+            try:
+                results = bus.dispatch(InferAdoptionCommand(
+                    session_id=arguments["session_id"],
+                    final_response=arguments["final_response"],
+                    experience_ids_injected=[experience_id],
+                ))
+                adoption_result = {"status": "ok", "results": results}
+            except Exception as e:
+                adoption_result = {"status": "error", "reason": str(e)}
+
+        result = {"extract": extract_result, "session": session_result, "adoption": adoption_result}
         return [TextContent(
             type="text",
             text=json.dumps({
@@ -442,12 +474,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 async def main():
-    global _service
+    global _bus
     from .project_config import ProjectManager
     project = ProjectManager().get_current()
-    store = ExperienceStore()
-    metrics = MetricsStore()
-    _service = KnowledgeService(store, metrics, project)
+    _bus = build_command_bus(project=project)
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())

@@ -27,11 +27,12 @@ def test_knowledge_get_stats_new_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
     monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
 
-    from src.storage import ExperienceStore, MetricsStore
-    from src.knowledge import KnowledgeService
+    from src.application.handlers.stats_handler import StatsHandler
+    from src.application.commands import GetStatsCommand
+    from src.infrastructure.unit_of_work import UnitOfWork
 
-    service = KnowledgeService(ExperienceStore(), MetricsStore())
-    stats = service.get_stats()
+    handler = StatsHandler(uow_factory=UnitOfWork)
+    stats = handler.handle_get_stats(GetStatsCommand())
 
     assert "archived_count" in stats
     assert "type_distribution" in stats

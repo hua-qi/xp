@@ -2,12 +2,12 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from src.models import (
+from ..models import (
     Experience, ExperienceMetadata, ExperienceSource, ExperienceStatus,
 )
-from src.domain.quality import compute_quality_score
-from src.domain.metadata import infer_tech_stack, infer_scene, infer_type, infer_level
-from src.file_watcher import calculate_files_hashes
+from ..domain.quality import compute_quality_score
+from ..domain.metadata import infer_tech_stack, infer_scene, infer_type, infer_level
+from ..file_watcher import calculate_files_hashes
 
 
 class ExtractionService:
@@ -100,7 +100,7 @@ class ExtractionService:
             exp.confidence = 0.65
             self._store.update(exp)
 
-        from src.embeddings import get_provider
+        from ..embeddings import get_provider
         provider = get_provider()
         exp_text = f"{exp.title}\n{exp.problem}\n{exp.key_decisions}"
         vec = provider.embed_text(exp_text)
@@ -109,7 +109,7 @@ class ExtractionService:
         return exp
 
     async def _check_duplicate(self, task_description: str, solution_summary: str):
-        from src.embeddings import get_provider, cosine_similarity
+        from ..embeddings import get_provider, cosine_similarity
         import numpy as np
 
         all_ids, all_vecs = self._vector_store.get_all_vectors()

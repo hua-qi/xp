@@ -4,6 +4,7 @@ from src.application.handlers.experience_handler import ExperienceHandler
 from src.application.commands import CreateExperienceCommand, ActivateExperienceCommand, ArchiveExperienceCommand
 from src.domain.events import ExperienceCreated, ExperienceActivated, ExperienceArchived
 from src.domain.constants import QUALITY_SCORE_AUTO_ACTIVATE
+from src.models import ExperienceStatus
 
 
 class FakeLLM:
@@ -73,7 +74,7 @@ def test_activate_experience_manually():
     handler.handle_activate(ActivateExperienceCommand(experience_id="exp-100"))
 
     exp = uow.experiences.get("exp-100")
-    assert exp.status == "ACTIVE"
+    assert exp.status == ExperienceStatus.ACTIVE
 
     events = uow.get_events()
     activated_events = [e for e in events if isinstance(e, ExperienceActivated)]
@@ -95,7 +96,7 @@ def test_archive_experience():
     handler.handle_archive(ArchiveExperienceCommand(experience_id="exp-200", reason="手动归档"))
 
     exp = uow.experiences.get("exp-200")
-    assert exp.status == "ARCHIVED"
+    assert exp.status == ExperienceStatus.ARCHIVED
 
     events = uow.get_events()
     archived_events = [e for e in events if isinstance(e, ExperienceArchived)]

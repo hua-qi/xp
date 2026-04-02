@@ -103,7 +103,11 @@ class ExperienceHandler:
             exp = uow.experiences.get(cmd.experience_id)
             if exp is None:
                 return False
-            exp.status = "ACTIVE"
+            try:
+                from ...models import ExperienceStatus
+                exp.status = ExperienceStatus.ACTIVE
+            except Exception:
+                exp.status = "ACTIVE"
             uow.experiences.update(exp)
             uow.collect_event(ExperienceActivated(
                 experience_id=cmd.experience_id,
@@ -116,7 +120,11 @@ class ExperienceHandler:
             exp = uow.experiences.get(cmd.experience_id)
             if exp is None:
                 return False
-            exp.status = "ARCHIVED"
+            try:
+                from ...models import ExperienceStatus
+                exp.status = ExperienceStatus.ARCHIVED
+            except Exception:
+                exp.status = "ARCHIVED"
             exp.reject_reason = cmd.reason
             uow.experiences.update(exp)
             uow.collect_event(ExperienceArchived(

@@ -22,7 +22,11 @@ class FeedbackHandler:
             exp.confidence = new_confidence
 
             if new_confidence <= AUTO_ARCHIVE_ADOPTION_THRESHOLD:
-                exp.status = "ARCHIVED"
+                try:
+                    from ...models import ExperienceStatus
+                    exp.status = ExperienceStatus.ARCHIVED
+                except Exception:
+                    exp.status = "ARCHIVED"
                 exp.reject_reason = "Low adoption rate, auto archived"
 
             uow.experiences.update(exp)

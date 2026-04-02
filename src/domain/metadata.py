@@ -1,4 +1,4 @@
-from src.models import ExperienceType, ExperienceLevel
+from ..models import ExperienceType, ExperienceLevel
 
 
 _TECH_KEYWORDS = {
