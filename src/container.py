@@ -14,6 +14,10 @@ from .application.commands import (
     ListExperiencesCommand,
     DeleteExperienceCommand,
     GetExperienceCommand,
+    SearchV2Command,
+    SaveCommand,
+    FeedbackV2Command,
+    ScanPromotionCandidatesCommand,
 )
 from .application.handlers.experience_handler import ExperienceHandler
 from .application.handlers.feedback_handler import FeedbackHandler
@@ -24,6 +28,10 @@ from .application.handlers.infer_adoption_handler import InferAdoptionHandler
 from .application.handlers.extract_handler import ExtractHandler
 from .application.handlers.experience_query_handler import ExperienceQueryHandler
 from .application.handlers.analyze_handler import AnalyzeHandler
+from .application.handlers.search_v2_handler import SearchV2Handler
+from .application.handlers.save_handler import SaveHandler
+from .application.handlers.feedback_v2_handler import FeedbackV2Handler
+from .application.handlers.promotion_handler import PromotionScanHandler
 from .infrastructure.unit_of_work import UnitOfWork
 
 
@@ -57,23 +65,34 @@ class _MetadataInferrer:
         }
 
 
-def build_command_bus(project: str = "default") -> CommandBus:
+async def build_command_bus(project: str = "default", dsn: str = None) -> CommandBus:
+    import os
+    from .infrastructure.backends.postgres import PostgresBackend
+
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL")
+    if not resolved_dsn:
+        raise RuntimeError("DATABASE_URL environment variable is required")
+
+    backend = PostgresBackend(dsn=resolved_dsn)
+    def uow_factory():
+        return UnitOfWork(backend=backend)
+
     llm = _SimpleLLM()
     metadata = _MetadataInferrer()
 
     experience_handler = ExperienceHandler(
-        uow_factory=UnitOfWork,
+        uow_factory=uow_factory,
         llm=llm,
         metadata_inferrer=metadata,
     )
-    feedback_handler = FeedbackHandler(uow_factory=UnitOfWork)
-    search_handler = SearchHandler(uow_factory=UnitOfWork, project=project)
-    session_handler = SessionHandler(uow_factory=UnitOfWork)
-    stats_handler = StatsHandler(uow_factory=UnitOfWork)
-    infer_adoption_handler = InferAdoptionHandler(uow_factory=UnitOfWork)
-    extract_handler = ExtractHandler(uow_factory=UnitOfWork, project=project)
-    query_handler = ExperienceQueryHandler(uow_factory=UnitOfWork)
-    analyze_handler = AnalyzeHandler(uow_factory=UnitOfWork)
+    feedback_handler = FeedbackHandler(uow_factory=uow_factory)
+    search_handler = SearchHandler(uow_factory=uow_factory, project=project)
+    session_handler = SessionHandler(uow_factory=uow_factory)
+    stats_handler = StatsHandler(uow_factory=uow_factory)
+    infer_adoption_handler = InferAdoptionHandler(uow_factory=uow_factory)
+    extract_handler = ExtractHandler(uow_factory=uow_factory, project=project)
+    query_handler = ExperienceQueryHandler(uow_factory=uow_factory)
+    analyze_handler = AnalyzeHandler(uow_factory=uow_factory)
 
     bus = CommandBus()
     bus.register(CreateExperienceCommand, experience_handler.handle_create)
@@ -90,4 +109,43 @@ def build_command_bus(project: str = "default") -> CommandBus:
     bus.register(GetExperienceCommand, query_handler.handle_get)
     bus.register(AnalyzeQualityCommand, analyze_handler.handle_analyze)
 
+    from .embeddings import get_provider
+    embedding_provider = get_provider()
+
+    search_event_store_instance = _InMemorySearchEventStore()
+
+    search_v2_handler = SearchV2Handler(
+        uow_factory=uow_factory,
+        embedding_provider=embedding_provider,
+    )
+    save_handler_v2 = SaveHandler(
+        uow_factory=uow_factory,
+        embedding_provider=embedding_provider,
+    )
+    feedback_v2_handler = FeedbackV2Handler(
+        uow_factory=uow_factory,
+        search_event_store=search_event_store_instance,
+    )
+
+    bus.register(SearchV2Command, search_v2_handler.handle)
+    bus.register(SaveCommand, save_handler_v2.handle)
+    bus.register(FeedbackV2Command, feedback_v2_handler.handle)
+
+    promotion_handler = PromotionScanHandler(
+        uow_factory=uow_factory,
+        embedding_provider=embedding_provider,
+    )
+    bus.register(ScanPromotionCandidatesCommand, promotion_handler.handle)
+
     return bus
+
+
+class _InMemorySearchEventStore:
+    def __init__(self):
+        self._events = {}
+
+    def save(self, event):
+        self._events[event.id] = event
+
+    def get(self, event_id: str):
+        return self._events.get(event_id)

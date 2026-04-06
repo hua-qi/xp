@@ -8,19 +8,17 @@ class StatsHandler:
     def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork]):
         self._uow_factory = uow_factory
 
-    def handle_get_stats(self, cmd: GetStatsCommand) -> dict:
-        from ...storage import ExperienceStore, MetricsStore
+    async def handle_get_stats(self, cmd: GetStatsCommand) -> dict:
         from ...models import ExperienceStatus
         from datetime import datetime, timedelta
 
-        store = ExperienceStore()
-        metrics = MetricsStore()
-
-        process = metrics.get_stats(cmd.since_days)
-
-        all_active = store.list_active()
-        pending = store.list_by_status(ExperienceStatus.PENDING)
-        archived = store.list_by_status(ExperienceStatus.ARCHIVED)
+        async with self._uow_factory() as uow:
+            process = await uow.analytics.get_stats(cmd.since_days)
+            all_active = await uow.experiences.alist_by_status("active")
+            pending = await uow.experiences.alist_by_status("pending")
+            archived = await uow.experiences.alist_by_status("archived")
+            hitted_ids = set(await uow.analytics.get_hitted_experience_ids())
+            miss_queries = await uow.analytics.get_search_miss_queries(since_days=30, limit=5)
 
         process["active_count"] = len(all_active)
         process["pending_count"] = len(pending)
@@ -39,19 +37,8 @@ class StatsHandler:
         else:
             process["avg_confidence"] = 0.0
 
-        hitted_ids = set(metrics.get_hitted_experience_ids())
         process["zombie_count"] = sum(1 for e in all_active if e.id not in hitted_ids)
-
-        top_adopted_raw = process.get("top_adopted_experiences", [])
-        enriched = []
-        for item in top_adopted_raw:
-            exp = store.get(item["experience_id"])
-            enriched.append({
-                **item,
-                "title": exp.title[:30] if exp else item["experience_id"][:8],
-            })
-        process["top_adopted_experiences"] = enriched
-        process["top_miss_queries"] = metrics.get_search_miss_queries(since_days=30, limit=5)
+        process["top_miss_queries"] = miss_queries
 
         cutoff_30 = (datetime.utcnow() - timedelta(days=30)).isoformat()
         all_exps = all_active + pending + archived

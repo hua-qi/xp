@@ -8,28 +8,15 @@ def test_storage_backend_is_abstract():
     assert inspect.isabstract(StorageBackend)
 
 
-def test_local_backend_implements_interface(tmp_path, monkeypatch):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-    from src.storage import LocalBackend
-    backend = LocalBackend()
-    assert hasattr(backend, "add_experience")
-    assert hasattr(backend, "get_experience")
-    assert hasattr(backend, "list_by_status")
-    assert hasattr(backend, "save_vector")
-
-
 POSTGRES_DSN = os.environ.get("TEST_POSTGRES_DSN", "")
 
 
 @pytest.mark.skipif(not POSTGRES_DSN, reason="TEST_POSTGRES_DSN not set")
-async def test_postgres_backend_add_and_get(tmp_path):
+async def test_postgres_backend_add_and_get():
     from src.infrastructure.backends.postgres import PostgresBackend
     from src.models import (
         Experience, ExperienceType, ExperienceLevel,
-        ExperienceStatus, ExperienceSource,
+        ExperienceStatus, ExperienceSource, ExperienceMetadata,
     )
     import uuid
     from datetime import datetime
@@ -50,6 +37,7 @@ async def test_postgres_backend_add_and_get(tmp_path):
         status=ExperienceStatus.PENDING,
         source=ExperienceSource.AGENT,
         created_at=datetime.utcnow().isoformat(),
+        metadata=ExperienceMetadata(),
     )
 
     await backend.async_add_experience(exp)
@@ -61,23 +49,3 @@ async def test_postgres_backend_add_and_get(tmp_path):
 
     await backend.async_delete_experience(exp.id)
     await backend.close()
-
-
-def test_get_backend_defaults_to_local(tmp_path, monkeypatch):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-    monkeypatch.delenv("XP_BACKEND", raising=False)
-    monkeypatch.delenv("XP_POSTGRES_DSN", raising=False)
-    from src.storage import get_backend, LocalBackend
-    backend = get_backend()
-    assert isinstance(backend, LocalBackend)
-
-
-def test_get_backend_postgres_requires_dsn(monkeypatch):
-    monkeypatch.setenv("XP_BACKEND", "postgres")
-    monkeypatch.delenv("XP_POSTGRES_DSN", raising=False)
-    from src.storage import get_backend
-    with pytest.raises(RuntimeError, match="XP_POSTGRES_DSN"):
-        get_backend()

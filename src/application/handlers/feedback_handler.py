@@ -11,9 +11,9 @@ class FeedbackHandler:
     def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork]):
         self._uow_factory = uow_factory
 
-    def handle_feedback(self, cmd: RecordFeedbackCommand):
-        with self._uow_factory() as uow:
-            exp = uow.experiences.get(cmd.experience_id)
+    async def handle_feedback(self, cmd: RecordFeedbackCommand):
+        async with self._uow_factory() as uow:
+            exp = await uow.experiences.aget(cmd.experience_id)
             if exp is None:
                 return False
 
@@ -29,7 +29,7 @@ class FeedbackHandler:
                     exp.status = "ARCHIVED"
                 exp.reject_reason = "Low adoption rate, auto archived"
 
-            uow.experiences.update(exp)
+            await uow.experiences.aupdate(exp)
             uow.collect_event(FeedbackRecorded(
                 experience_id=cmd.experience_id,
                 helpful=cmd.helpful,

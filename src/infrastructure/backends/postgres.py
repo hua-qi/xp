@@ -1,15 +1,25 @@
 import json
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from datetime import datetime
-
-import asyncpg
-import numpy as np
 
 from .base import StorageBackend
 from ...models import (
     Experience, ExperienceType, ExperienceLevel, ExperienceMetadata,
     ExperienceSource, ExperienceStatus, Session, Feedback, ExperienceStats,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
+
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
 
 CREATE_SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -34,6 +44,12 @@ CREATE TABLE IF NOT EXISTS experiences (
     project TEXT NOT NULL DEFAULT 'default',
     last_hit_at TEXT,
     stale_reason TEXT,
+    scope_type TEXT NOT NULL DEFAULT 'project',
+    scope_id TEXT,
+    promoted_to TEXT,
+    demoted_from TEXT,
+    recall_count INTEGER NOT NULL DEFAULT 0,
+    adoption_rate FLOAT NOT NULL DEFAULT 0.0,
     embedding vector(512)
 );
 
@@ -65,6 +81,84 @@ CREATE TABLE IF NOT EXISTS experience_stats (
     last_used_at TEXT,
     last_adopted_at TEXT,
     adoption_rate FLOAT DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS teams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS businesses (
+    id TEXT PRIMARY KEY,
+    team_id TEXT NOT NULL REFERENCES teams(id),
+    name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    business_id TEXT NOT NULL REFERENCES businesses(id),
+    name TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT '',
+    frameworks JSONB NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS search_events (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    query_text TEXT NOT NULL,
+    query_embedding vector(512),
+    result_ids JSONB NOT NULL DEFAULT '[]',
+    timestamp TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_events (
+    id TEXT PRIMARY KEY,
+    search_event_id TEXT NOT NULL REFERENCES search_events(id),
+    helpful_ids JSONB NOT NULL DEFAULT '[]',
+    unhelpful_ids JSONB NOT NULL DEFAULT '[]',
+    comment TEXT,
+    timestamp TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_business (
+    project_id TEXT NOT NULL,
+    business_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, business_id)
+);
+
+CREATE TABLE IF NOT EXISTS business_team (
+    business_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    PRIMARY KEY (business_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_business (
+    user_id TEXT NOT NULL,
+    business_id TEXT NOT NULL,
+    PRIMARY KEY (user_id, business_id)
+);
+
+ALTER TABLE teams ADD COLUMN IF NOT EXISTS owner_email TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS owner_email TEXT;
+
+CREATE TABLE IF NOT EXISTS user_tokens (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    email TEXT,
+    database_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS promotion_candidates (
+    id TEXT PRIMARY KEY,
+    experience_id TEXT NOT NULL,
+    target_scope_type TEXT NOT NULL,
+    target_scope_id TEXT NOT NULL,
+    score FLOAT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    ignored_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 """
 
@@ -250,12 +344,12 @@ class PostgresBackend(StorageBackend):
     def get_all_vectors(self, exp_ids: Optional[list[str]] = None):
         raise NotImplementedError("Use async_get_all_vectors for PostgresBackend")
 
-    async def async_get_all_vectors(self, exp_ids: Optional[list[str]] = None) -> tuple[list[str], np.ndarray]:
+    async def async_get_all_vectors(self, exp_ids: Optional[list[str]] = None) -> "tuple[list[str], np.ndarray]":
         self._pool_required()
         async with self._pool.acquire() as conn:
             if exp_ids is not None:
                 if not exp_ids:
-                    return [], np.array([])
+                    return [], _np.array([])
                 rows = await conn.fetch(
                     "SELECT id, embedding FROM experiences WHERE id = ANY($1) AND embedding IS NOT NULL",
                     exp_ids,
@@ -263,12 +357,127 @@ class PostgresBackend(StorageBackend):
             else:
                 rows = await conn.fetch("SELECT id, embedding FROM experiences WHERE embedding IS NOT NULL")
         if not rows:
-            return [], np.array([])
+            return [], _np.array([])
         ids = [r["id"] for r in rows]
-        vecs = np.array([list(r["embedding"]) for r in rows], dtype=np.float32)
+        vecs = _np.array([list(r["embedding"]) for r in rows], dtype=_np.float32)
         return ids, vecs
 
-    def _row_to_experience(self, row) -> Experience:
+    async def async_get_stats(self, since_days: int | None = None) -> dict:
+        self._pool_required()
+        from datetime import datetime, timedelta
+        async with self._pool.acquire() as conn:
+            date_filter = ""
+            params: list = []
+            if since_days:
+                cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+                date_filter = "WHERE created_at >= $1"
+                params = [cutoff]
+
+            search_total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM search_events {date_filter}", *params
+            ) or 0
+            search_hit = await conn.fetchval(
+                f"SELECT COUNT(*) FROM search_events {date_filter} {'AND' if date_filter else 'WHERE'} result_ids != '[]'",
+                *params
+            ) or 0
+            session_total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM sessions {date_filter}", *params
+            ) or 0
+            top_adopted_rows = await conn.fetch(
+                "SELECT experience_id, adoption_rate, hit_count FROM experience_stats WHERE hit_count >= 3 ORDER BY adoption_rate DESC LIMIT 3"
+            )
+            cutoff_30 = (datetime.utcnow() - timedelta(days=30)).isoformat()
+            new_sessions_30d = await conn.fetchval(
+                "SELECT COUNT(*) FROM sessions WHERE created_at >= $1", cutoff_30
+            ) or 0
+
+        return {
+            "search_total": search_total,
+            "search_hit_rate": round(search_hit / search_total, 3) if search_total else 0,
+            "review_confirmed": 0,
+            "review_rejected": 0,
+            "review_pass_rate": 0.0,
+            "session_total": session_total,
+            "result_shown": {"count": 0, "avg_iterations": 0.0, "error_rate": 0.0, "accept_rate": 0.0},
+            "result_not_shown": {"count": 0, "avg_iterations": 0.0, "error_rate": 0.0, "accept_rate": 0.0},
+            "avg_result_count": 0.0,
+            "query_adoption_rate": 0.0,
+            "top_adopted_experiences": [
+                {"experience_id": r["experience_id"], "adoption_rate": r["adoption_rate"], "hit_count": r["hit_count"]}
+                for r in top_adopted_rows
+            ],
+            "zombie_count_db": 0,
+            "ab_test_groups": {},
+            "new_sessions_30d": new_sessions_30d,
+        }
+
+    async def async_get_feedback_summary(self, since_days: int | None = None) -> dict:
+        self._pool_required()
+        from datetime import datetime, timedelta
+        async with self._pool.acquire() as conn:
+            date_filter = ""
+            params: list = []
+            if since_days:
+                cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+                date_filter = "WHERE created_at >= $1"
+                params = [cutoff]
+
+            total = await conn.fetchval(f"SELECT COUNT(*) FROM feedback {date_filter}", *params) or 0
+            adopted = await conn.fetchval(
+                f"SELECT COUNT(*) FROM feedback {date_filter} {'AND' if date_filter else 'WHERE'} adopted = true",
+                *params
+            ) or 0
+            low_rows = await conn.fetch(
+                "SELECT experience_id FROM experience_stats WHERE adoption_rate < 0.3"
+            )
+
+        return {
+            "total_feedback": total,
+            "adopted_count": adopted,
+            "adoption_rate": round(adopted / total, 3) if total else 0.0,
+            "low_adoption_count": len(low_rows),
+            "low_adoption_ids": [r["experience_id"] for r in low_rows],
+            "reject_reasons": {},
+        }
+
+    async def async_get_search_miss_queries(self, since_days: int = 30, limit: int = 10) -> list[dict]:
+        self._pool_required()
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT query_text, COUNT(*) as cnt FROM search_events WHERE result_ids = '[]' AND timestamp >= $1 GROUP BY query_text ORDER BY cnt DESC LIMIT $2",
+                cutoff, limit
+            )
+        return [{"query": r["query_text"], "count": r["cnt"]} for r in rows]
+
+    async def async_get_recent_query_keywords(self, since_days: int = 30, top_k: int = 20) -> list[str]:
+        self._pool_required()
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT query_text FROM search_events WHERE timestamp >= $1", cutoff
+            )
+        word_count: dict[str, int] = {}
+        for r in rows:
+            for word in r["query_text"].split():
+                if len(word) >= 2:
+                    word_count[word] = word_count.get(word, 0) + 1
+        return sorted(word_count, key=lambda w: -word_count[w])[:top_k]
+
+    async def async_get_hitted_experience_ids(self) -> list[str]:
+        self._pool_required()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT experience_id FROM experience_stats WHERE hit_count > 0"
+            )
+        return [r["experience_id"] for r in rows]
+
+    async def async_get_review_reject_reasons(self, limit: int = 10) -> dict[str, int]:
+        return {}
+
+
         meta = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
         return Experience(
             id=row["id"],

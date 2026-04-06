@@ -28,16 +28,10 @@ class TestSearchServiceABTest:
 
 
 class TestSearchServiceEmptyStore:
-    def test_empty_store_returns_empty(self, tmp_path, monkeypatch):
-        import src.storage as storage_mod
-        monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-        monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
-        monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-
+    async def test_empty_store_returns_empty(self):
         from src.embeddings import EmbeddingProvider, set_provider
-        from src.storage import ExperienceStore, VectorStore, MetricsStore
+        from tests.helpers.fake_uow import InMemoryExperienceStore, InMemoryVectorStore, InMemoryMetricsStore
         from src.domain.search import SearchService
-        import asyncio
 
         class FakeProvider(EmbeddingProvider):
             def embed_text(self, text):
@@ -47,16 +41,14 @@ class TestSearchServiceEmptyStore:
             def embed_texts(self, texts):
                 return [self.embed_text(t) for t in texts]
 
-        set_provider(FakeProvider())
-        store = ExperienceStore()
-        v_store = VectorStore()
-        metrics = MetricsStore()
+        provider = FakeProvider()
+        set_provider(provider)
+        store = InMemoryExperienceStore()
+        v_store = InMemoryVectorStore()
+        metrics = InMemoryMetricsStore()
 
-        svc = SearchService(store, v_store, metrics, FakeProvider(), project="default")
-
-        loop = asyncio.new_event_loop()
-        results, meta = loop.run_until_complete(svc.search("query"))
-        loop.close()
+        svc = SearchService(store, v_store, metrics, provider, project="default")
+        results, meta = await svc.search("query")
 
         assert results == []
         assert meta["strategy"] == "embedding_only"

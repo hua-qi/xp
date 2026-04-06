@@ -12,17 +12,15 @@ class FakeProvider(EmbeddingProvider):
         return vecs
 
 
-@pytest.fixture
-def extraction_deps(tmp_path, monkeypatch):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-
+@pytest.fixture(autouse=True)
+def fake_embedding():
     set_provider(FakeProvider())
 
-    from src.storage import ExperienceStore, VectorStore
-    return ExperienceStore(), VectorStore()
+
+@pytest.fixture
+def extraction_deps():
+    from tests.helpers.fake_uow import InMemoryExperienceStore, InMemoryVectorStore
+    return InMemoryExperienceStore(), InMemoryVectorStore()
 
 
 class TestExtractionService:

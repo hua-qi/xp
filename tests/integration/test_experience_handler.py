@@ -25,13 +25,14 @@ def _make_handler(uow):
     )
 
 
-def test_create_high_quality_experience_auto_activates():
+@pytest.mark.asyncio
+async def test_create_high_quality_experience_auto_activates():
     uow = InMemoryUnitOfWork()
     handler = _make_handler(uow)
     cmd = CreateExperienceCommand(
         task_output="问题描述\n" + "这是详细的解决方案描述" * 6 + "\n" + "关键技术决策详细说明" * 6,
     )
-    exp = handler.handle_create(cmd)
+    exp = await handler.handle_create(cmd)
 
     assert exp is not None
     assert exp.status == "ACTIVE"
@@ -44,13 +45,14 @@ def test_create_high_quality_experience_auto_activates():
     assert activated_events[0].triggered_by == "auto"
 
 
-def test_create_low_quality_experience_stays_pending():
+@pytest.mark.asyncio
+async def test_create_low_quality_experience_stays_pending():
     uow = InMemoryUnitOfWork()
     handler = _make_handler(uow)
     cmd = CreateExperienceCommand(
         task_output="问题描述\n解决方案很简短\n" + "关键决策详细说明" * 3,
     )
-    exp = handler.handle_create(cmd)
+    exp = await handler.handle_create(cmd)
 
     assert exp is not None
     assert exp.status == "PENDING"
@@ -60,7 +62,8 @@ def test_create_low_quality_experience_stays_pending():
     assert len(activated_events) == 0
 
 
-def test_activate_experience_manually():
+@pytest.mark.asyncio
+async def test_activate_experience_manually():
     uow = InMemoryUnitOfWork()
 
     class FakeExp:
@@ -71,7 +74,7 @@ def test_activate_experience_manually():
 
     uow.experiences._committed["exp-100"] = FakeExp()
     handler = _make_handler(uow)
-    handler.handle_activate(ActivateExperienceCommand(experience_id="exp-100"))
+    await handler.handle_activate(ActivateExperienceCommand(experience_id="exp-100"))
 
     exp = uow.experiences.get("exp-100")
     assert exp.status == ExperienceStatus.ACTIVE
@@ -82,7 +85,8 @@ def test_activate_experience_manually():
     assert activated_events[0].triggered_by == "manual"
 
 
-def test_archive_experience():
+@pytest.mark.asyncio
+async def test_archive_experience():
     uow = InMemoryUnitOfWork()
 
     class FakeExp:
@@ -93,7 +97,7 @@ def test_archive_experience():
 
     uow.experiences._committed["exp-200"] = FakeExp()
     handler = _make_handler(uow)
-    handler.handle_archive(ArchiveExperienceCommand(experience_id="exp-200", reason="手动归档"))
+    await handler.handle_archive(ArchiveExperienceCommand(experience_id="exp-200", reason="手动归档"))
 
     exp = uow.experiences.get("exp-200")
     assert exp.status == ExperienceStatus.ARCHIVED

@@ -1,38 +1,13 @@
 import pytest
-from src.storage import MetricsStore
+from tests.helpers.fake_uow import InMemoryUnitOfWork
 
 
-def test_get_stats_new_fields_exist(tmp_path, monkeypatch):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-
-    store = MetricsStore()
-    stats = store.get_stats()
-
-    assert "avg_result_count" in stats
-    assert "query_adoption_rate" in stats
-    assert "top_adopted_experiences" in stats
-    assert isinstance(stats["top_adopted_experiences"], list)
-    assert "zombie_count_db" in stats
-    assert "ab_test_groups" in stats
-    assert "treatment" in stats["ab_test_groups"]
-    assert "control" in stats["ab_test_groups"]
-    assert "new_sessions_30d" in stats
-
-
-def test_knowledge_get_stats_new_fields(tmp_path, monkeypatch):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-    monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
-
+async def test_get_stats_fields_exist():
     from src.application.handlers.stats_handler import StatsHandler
     from src.application.commands import GetStatsCommand
-    from src.infrastructure.unit_of_work import UnitOfWork
 
-    handler = StatsHandler(uow_factory=UnitOfWork)
-    stats = handler.handle_get_stats(GetStatsCommand())
+    handler = StatsHandler(uow_factory=InMemoryUnitOfWork)
+    stats = await handler.handle_get_stats(GetStatsCommand())
 
     assert "archived_count" in stats
     assert "type_distribution" in stats
@@ -45,14 +20,26 @@ def test_knowledge_get_stats_new_fields(tmp_path, monkeypatch):
     assert "new_sessions" in stats["trend_30d"]
 
 
-def test_cmd_stats_no_crash(tmp_path, monkeypatch, capsys):
-    import src.storage as storage_mod
-    monkeypatch.setattr(storage_mod, "XP_HOME", tmp_path)
-    monkeypatch.setattr(storage_mod, "METRICS_DB", tmp_path / "metrics.db")
-    monkeypatch.setattr(storage_mod, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+async def test_cmd_stats_no_crash(monkeypatch, capsys):
+    from unittest.mock import patch, AsyncMock, MagicMock
 
-    from src.cli import cmd_stats
-    cmd_stats([])
+    mock_bus = MagicMock()
+    mock_bus.dispatch = AsyncMock(return_value={
+        "session_total": 0,
+        "result_shown": {"count": 0, "avg_iterations": 0.0, "error_rate": 0.0, "accept_rate": 0.0},
+        "result_not_shown": {"count": 0, "avg_iterations": 0.0, "error_rate": 0.0, "accept_rate": 0.0},
+        "active_count": 0, "pending_count": 0, "archived_count": 0,
+        "type_distribution": {}, "avg_confidence": 0.0,
+        "search_total": 0, "search_hit_rate": 0.0, "avg_result_count": 0.0,
+        "query_adoption_rate": 0.0, "top_miss_queries": [],
+        "review_confirmed": 0, "review_rejected": 0, "review_pass_rate": 0.0,
+        "top_adopted_experiences": [], "zombie_count": 0,
+        "trend_30d": {"new_experiences": 0, "new_sessions": 0},
+    })
+
+    with patch("src.cli._get_bus", AsyncMock(return_value=mock_bus)):
+        from src.cli import cmd_stats
+        await cmd_stats([])
 
     captured = capsys.readouterr()
     assert "效果对比" in captured.out
@@ -60,3 +47,18 @@ def test_cmd_stats_no_crash(tmp_path, monkeypatch, capsys):
     assert "检索质量" in captured.out
     assert "经验价值分布" in captured.out
     assert "时间趋势" in captured.out
+
+
+def test_get_stats_command_has_scope_filters():
+    from src.application.commands import GetStatsCommand
+    cmd = GetStatsCommand(
+        since_days=7,
+        project_id="proj-001",
+        business_id="biz-001",
+        team_id="team-001",
+        compare=True,
+    )
+    assert cmd.project_id == "proj-001"
+    assert cmd.business_id == "biz-001"
+    assert cmd.team_id == "team-001"
+    assert cmd.compare is True

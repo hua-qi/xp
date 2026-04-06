@@ -24,7 +24,7 @@ class ExperienceHandler:
         self._llm = llm
         self._metadata = metadata_inferrer
 
-    def handle_create(self, cmd: CreateExperienceCommand):
+    async def handle_create(self, cmd: CreateExperienceCommand):
         parts = cmd.task_output.split("\n", 2)
         task_desc = parts[0] if len(parts) > 0 else cmd.task_output
         solution = parts[1] if len(parts) > 1 else ""
@@ -91,15 +91,15 @@ class ExperienceHandler:
             exp.confidence = CONFIDENCE_AUTO_ACTIVATE_INITIAL
             events.append(ExperienceActivated(experience_id=exp_id, triggered_by="auto"))
 
-        with self._uow_factory() as uow:
+        async with self._uow_factory() as uow:
             uow.experiences.add(exp)
             for event in events:
                 uow.collect_event(event)
 
         return exp
 
-    def handle_activate(self, cmd: ActivateExperienceCommand):
-        with self._uow_factory() as uow:
+    async def handle_activate(self, cmd: ActivateExperienceCommand):
+        async with self._uow_factory() as uow:
             exp = uow.experiences.get(cmd.experience_id)
             if exp is None:
                 return False
@@ -115,8 +115,8 @@ class ExperienceHandler:
             ))
         return True
 
-    def handle_archive(self, cmd: ArchiveExperienceCommand):
-        with self._uow_factory() as uow:
+    async def handle_archive(self, cmd: ArchiveExperienceCommand):
+        async with self._uow_factory() as uow:
             exp = uow.experiences.get(cmd.experience_id)
             if exp is None:
                 return False

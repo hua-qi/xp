@@ -9,11 +9,9 @@ class ExtractHandler:
         self._uow_factory = uow_factory
         self._project = project
 
-    def handle_extract(self, cmd: ExtractExperienceCommand):
+    async def handle_extract(self, cmd: ExtractExperienceCommand):
         from ...domain.extraction import ExtractionService
-        from ...storage import ExperienceStore, VectorStore
         import os
-        import asyncio
 
         title = None
         try:
@@ -33,29 +31,15 @@ class ExtractHandler:
         except Exception:
             title = None
 
-        store = ExperienceStore()
-        v_store = VectorStore()
-        svc = ExtractionService(store, v_store, project=self._project)
-
-        import asyncio
-        coro = svc.extract(
-            cmd.task_description,
-            cmd.solution_summary,
-            cmd.key_decisions,
-            cmd.conversation_summary,
-            cmd.tags,
-            cmd.related_files,
-            title=title,
-        )
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, coro)
-                    exp = future.result()
-            else:
-                exp = loop.run_until_complete(coro)
-        except RuntimeError:
-            exp = asyncio.run(coro)
+        async with self._uow_factory() as uow:
+            svc = ExtractionService(uow.experiences, uow.vectors, project=self._project)
+            exp = await svc.extract(
+                cmd.task_description,
+                cmd.solution_summary,
+                cmd.key_decisions,
+                cmd.conversation_summary,
+                cmd.tags,
+                cmd.related_files,
+                title=title,
+            )
         return exp

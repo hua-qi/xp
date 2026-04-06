@@ -29,3 +29,23 @@ def compute_quality_score(
         score += 10
 
     return score
+
+
+def compute_save_quality_score(
+    solution: str,
+    key_decisions: str,
+    tags: list[str],
+    outcome: str,
+) -> int:
+    score = 0
+    if len(solution.strip()) > 50:
+        score += 30
+    if len(key_decisions.strip()) > 30:
+        score += 30
+    if len(tags) >= 2:
+        score += 20
+    if outcome == "success":
+        score += 20
+    else:
+        score += 10
+    return score

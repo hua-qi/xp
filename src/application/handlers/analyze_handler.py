@@ -8,25 +8,28 @@ class AnalyzeHandler:
     def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork]):
         self._uow_factory = uow_factory
 
-    def handle_analyze(self, cmd: AnalyzeQualityCommand) -> dict:
-        from ...storage import ExperienceStore, MetricsStore, VectorStore
+    async def handle_analyze(self, cmd: AnalyzeQualityCommand) -> dict:
         from ...models import ExperienceStatus
         from datetime import datetime, timedelta
 
-        store = ExperienceStore()
-        metrics = MetricsStore()
+        async with self._uow_factory() as uow:
+            feedback_summary = await uow.analytics.get_feedback_summary()
+            review_reject_reasons = await uow.analytics.get_review_reject_reasons()
+            miss_queries = await uow.analytics.get_search_miss_queries(since_days=30)
+            recent_keywords = await uow.analytics.get_recent_query_keywords(since_days=30)
 
-        feedback_summary = metrics.get_feedback_summary()
+            all_exps = []
+            for status in ["pending", "active", "archived"]:
+                all_exps.extend(await uow.experiences.alist_by_status(status))
 
-        all_exps = []
-        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-            all_exps.extend(store.list_by_status(status))
+            active_exps = [e for e in all_exps if e.status == ExperienceStatus.ACTIVE]
+            active_ids = [e.id for e in active_exps[:200]]
+            ids, vecs = await uow.vectors.aget_all_vectors(active_ids) if active_ids else ([], [])
 
         pending_count = len([e for e in all_exps if e.status == ExperienceStatus.PENDING])
-        active_count = len([e for e in all_exps if e.status == ExperienceStatus.ACTIVE])
+        active_count = len(active_exps)
         archived_count = len([e for e in all_exps if e.status == ExperienceStatus.ARCHIVED])
 
-        review_reject_reasons = metrics.get_review_reject_reasons()
         low_quality_patterns = []
 
         if feedback_summary["total_feedback"] > 0 and feedback_summary["adoption_rate"] < 0.5:
@@ -79,7 +82,6 @@ class AnalyzeHandler:
                 "actions": actions,
             })
 
-        miss_queries = metrics.get_search_miss_queries(since_days=30)
         if miss_queries:
             top_queries = [f'"{q["query"]}" ({q["count"]} 次)' for q in miss_queries[:5]]
             low_quality_patterns.append({
@@ -90,19 +92,15 @@ class AnalyzeHandler:
                 "actions": ["xp add  # 补充新经验"],
             })
 
-        active_exps = [e for e in all_exps if e.status == ExperienceStatus.ACTIVE]
-        if len(active_exps) >= 2:
+        import numpy as np
+        if len(ids) >= 2:
             from ...embeddings import cosine_similarity
-            v_store = VectorStore()
-            active_ids = [e.id for e in active_exps[:200]]
-            ids, vecs = v_store.get_all_vectors(active_ids)
             duplicates = []
-            if len(ids) >= 2:
-                for i in range(len(ids)):
-                    for j in range(i + 1, len(ids)):
-                        sim = float(cosine_similarity(vecs[i], vecs[j:j+1])[0])
-                        if sim >= 0.92:
-                            duplicates.append((ids[i], ids[j], sim))
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    sim = float(cosine_similarity(vecs[i], vecs[j:j+1])[0])
+                    if sim >= 0.92:
+                        duplicates.append((ids[i], ids[j], sim))
             if duplicates:
                 actions = []
                 seen: set[str] = set()
@@ -118,7 +116,6 @@ class AnalyzeHandler:
                     "actions": actions,
                 })
 
-        recent_keywords = metrics.get_recent_query_keywords(since_days=30)
         all_exp_tags: set[str] = set()
         for e in all_exps:
             if e.status == ExperienceStatus.ACTIVE:

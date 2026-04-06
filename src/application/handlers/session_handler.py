@@ -8,12 +8,10 @@ class SessionHandler:
     def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork]):
         self._uow_factory = uow_factory
 
-    def handle_record_session(self, cmd: RecordSessionCommand):
-        from ...storage import MetricsStore
+    async def handle_record_session(self, cmd: RecordSessionCommand):
         from ...models import Session
         from datetime import datetime
 
-        metrics = MetricsStore()
         session = Session(
             session_id=cmd.session_id,
             task_description=cmd.task_description,
@@ -25,5 +23,6 @@ class SessionHandler:
             ab_test_group=cmd.ab_test_group,
             ab_test_result_shown=cmd.ab_test_result_shown,
         )
-        metrics.record_session(session)
+        async with self._uow_factory() as uow:
+            await uow.analytics.record_session(session)
         return True

@@ -13,6 +13,7 @@ from ..application.commands import (
     RecordSessionCommand,
     GetStatsCommand,
     InferAdoptionCommand,
+    ScanPromotionCandidatesCommand,
 )
 
 
@@ -57,14 +58,14 @@ def create_app() -> FastAPI:
     app = FastAPI(title="xp-server", version="0.3.0")
 
     @app.get("/api/health")
-    def health():
+    async def health():
         return {"status": "ok"}
 
     @app.post("/api/experiences", status_code=201)
-    def extract_experience(req: ExtractRequest):
-        bus = build_command_bus()
+    async def extract_experience(req: ExtractRequest):
+        bus = await build_command_bus()
         try:
-            exp = bus.dispatch(ExtractExperienceCommand(
+            exp = await bus.dispatch(ExtractExperienceCommand(
                 task_description=req.task_description,
                 solution_summary=req.solution_summary,
                 key_decisions=req.key_decisions,
@@ -82,15 +83,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/api/experiences/search")
-    def search_experiences(
+    async def search_experiences(
         q: str,
         top_k: int = 3,
         session_id: Optional[str] = None,
         tags: Optional[str] = None,
     ):
-        bus = build_command_bus()
+        bus = await build_command_bus()
         tag_list = tags.split(",") if tags else None
-        results, meta = bus.dispatch(SearchCommand(
+        results, meta = await bus.dispatch(SearchCommand(
             query=q,
             tags=tag_list,
             top_k=top_k,
@@ -113,22 +114,22 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/experiences")
-    def list_experiences(status: str = "pending"):
-        bus = build_command_bus()
+    async def list_experiences(status: str = "pending"):
+        bus = await build_command_bus()
         try:
-            exps = bus.dispatch(ListExperiencesCommand(status=status))
+            exps = await bus.dispatch(ListExperiencesCommand(status=status))
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"experiences": [{"id": e.id, "title": e.title, "status": e.status.value,
                                   "confidence": e.confidence} for e in exps]}
 
     @app.patch("/api/experiences/{exp_id}")
-    def review_experience(exp_id: str, req: ReviewRequest):
-        bus = build_command_bus()
+    async def review_experience(exp_id: str, req: ReviewRequest):
+        bus = await build_command_bus()
         if req.action == "activate":
-            success = bus.dispatch(ActivateExperienceCommand(experience_id=exp_id))
+            success = await bus.dispatch(ActivateExperienceCommand(experience_id=exp_id))
         elif req.action == "archive":
-            success = bus.dispatch(ArchiveExperienceCommand(experience_id=exp_id, reason=req.reason or ""))
+            success = await bus.dispatch(ArchiveExperienceCommand(experience_id=exp_id, reason=req.reason or ""))
         else:
             raise HTTPException(400, f"Unknown action: {req.action}")
         if not success:
@@ -136,9 +137,9 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/api/feedback")
-    def record_feedback(req: FeedbackRequest):
-        bus = build_command_bus()
-        success = bus.dispatch(RecordFeedbackCommand(
+    async def record_feedback(req: FeedbackRequest):
+        bus = await build_command_bus()
+        success = await bus.dispatch(RecordFeedbackCommand(
             experience_id=req.experience_id,
             helpful=req.adopted,
         ))
@@ -147,9 +148,9 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/api/sessions")
-    def record_session(req: SessionRequest):
-        bus = build_command_bus()
-        bus.dispatch(RecordSessionCommand(
+    async def record_session(req: SessionRequest):
+        bus = await build_command_bus()
+        await bus.dispatch(RecordSessionCommand(
             session_id=req.session_id,
             task_description=req.task_description,
             experience_ids_injected=req.experience_ids_injected,
@@ -162,18 +163,35 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/api/stats")
-    def get_stats(since: Optional[int] = None):
-        bus = build_command_bus()
-        return bus.dispatch(GetStatsCommand(since_days=since))
+    async def get_stats(since: Optional[int] = None):
+        bus = await build_command_bus()
+        return await bus.dispatch(GetStatsCommand(since_days=since))
 
     @app.post("/api/infer-adoption")
-    def infer_adoption(req: InferAdoptionRequest):
-        bus = build_command_bus()
-        results = bus.dispatch(InferAdoptionCommand(
+    async def infer_adoption(req: InferAdoptionRequest):
+        bus = await build_command_bus()
+        results = await bus.dispatch(InferAdoptionCommand(
             session_id=req.session_id,
             final_response=req.final_response,
             experience_ids_injected=req.experience_ids_injected,
         ))
         return {"results": results}
+
+    class PromoteScopeRequest(BaseModel):
+        target_scope: str
+        target_scope_id: str
+
+    @app.post("/api/promotion/scan")
+    async def scan_promotion_candidates(dry_run: bool = False):
+        bus = await build_command_bus()
+        return await bus.dispatch(ScanPromotionCandidatesCommand(dry_run=dry_run))
+
+    @app.post("/api/promotion/{exp_id}/promote")
+    async def promote_experience(exp_id: str, req: PromoteScopeRequest):
+        bus = await build_command_bus()
+        success = await bus.dispatch(ActivateExperienceCommand(experience_id=exp_id))
+        if not success:
+            raise HTTPException(404, "Experience not found")
+        return {"status": "ok", "experience_id": exp_id, "target_scope": req.target_scope}
 
     return app

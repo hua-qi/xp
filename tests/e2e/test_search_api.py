@@ -1,21 +1,10 @@
 import pytest
-from unittest.mock import MagicMock
-import numpy as np
-
-
-@pytest.fixture(autouse=True)
-def mock_embedding(monkeypatch):
-    import src.embeddings as emb_mod
-    mock_provider = MagicMock()
-    vec = np.random.rand(384).astype(np.float32)
-    vec = vec / np.linalg.norm(vec)
-    mock_provider.embed_text.return_value = vec.tolist()
-    mock_provider.embed_texts.return_value = [vec.tolist()]
-    monkeypatch.setattr(emb_mod, "get_provider", lambda: mock_provider)
+from unittest.mock import AsyncMock
 
 
 class TestSearchAPI:
-    def test_search_returns_200(self, client):
+    def test_search_returns_200(self, client, mock_bus):
+        mock_bus.dispatch = AsyncMock(return_value=([], {"ab_test_group": "treatment", "strategy": "embedding_only"}))
         response = client.get("/api/experiences/search?q=防抖&top_k=3")
         assert response.status_code == 200
         data = response.json()
@@ -26,7 +15,8 @@ class TestSearchAPI:
         response = client.get("/api/experiences/search")
         assert response.status_code == 422
 
-    def test_search_result_structure(self, client):
+    def test_search_result_structure(self, client, mock_bus):
+        mock_bus.dispatch = AsyncMock(return_value=([], {"ab_test_group": "treatment", "strategy": "embedding_only"}))
         response = client.get("/api/experiences/search?q=react hooks")
         data = response.json()
         assert isinstance(data["results"], list)

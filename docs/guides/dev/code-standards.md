@@ -1,6 +1,6 @@
 # XP 项目整体规范
 
-> 版本：v1.0 · 日期：2026-02-04
+> 版本：v1.1 · 日期：2026-05-04
 
 ---
 
@@ -132,15 +132,15 @@ class Experience:
 
 - 每个 Handler 文件不超过 **150 行**
 - Handler 只能通过构造函数注入依赖，不允许在方法内实例化任何 I/O 对象
-- Handler 方法必须接收 Command 对象，返回结果或事件列表
+- Handler 方法必须是 `async def`，接收 Command 对象，返回结果或事件列表
 
 ```python
 class ExperienceHandler:
     def __init__(self, uow_factory, llm, metadata_inferrer):  # 注入
         ...
 
-    def handle_create(self, cmd: CreateExperienceCommand):
-        with self._uow_factory() as uow:
+    async def handle_create(self, cmd: CreateExperienceCommand):
+        async with self._uow_factory() as uow:
             ...
         return result
 ```
@@ -148,19 +148,19 @@ class ExperienceHandler:
 ### 3.5 Unit of Work 规范
 
 - 每个请求/命令创建一个新的 UoW 实例（不复用）
-- 使用 `with` 语句，异常自动回滚
+- 使用 `async with` 语句，异常自动回滚
 - 事件在 `commit()` 成功后才分发，不允许在 commit 前发布副作用
 
 ```python
 # ✅ 正确用法
-with uow_factory() as uow:
+async with uow_factory() as uow:
     uow.experiences.add(exp)
     uow.collect_event(ExperienceCreated(...))
 
 # ❌ 错误用法
 uow = UnitOfWork()
 uow.experiences.add(exp)
-uow.commit()             # 忘记处理异常
+uow.commit()             # 忘记处理异常，且不支持 async
 ```
 
 ### 3.6 事件规范

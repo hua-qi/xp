@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from .auth import verify_token
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path.cwd() / ".env", override=False)
 
-# 修复中文输入问题
 if sys.platform == "darwin" or sys.platform.startswith("linux"):
     import locale
     locale.setlocale(locale.LC_ALL, "")
@@ -18,14 +19,38 @@ if sys.platform == "darwin" or sys.platform.startswith("linux"):
     readline.parse_and_bind("set convert-meta off")
 
 
-def _get_bus(project: str = None):
+async def _get_bus(project: str = None):
+    import os
     from .container import build_command_bus
     from .project_config import ProjectManager
+    from .config import load_config
 
     if project is None:
         project = ProjectManager().get_current()
 
-    return build_command_bus(project=project)
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        config = load_config()
+        if config:
+            dsn = config.get("database_url")
+
+    return await build_command_bus(project=project, dsn=dsn)
+
+
+async def _get_uow():
+    import os
+    from .infrastructure.unit_of_work import UnitOfWork
+    from .infrastructure.backends.postgres import PostgresBackend
+    from .config import load_config
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        config = load_config()
+        if config:
+            dsn = config.get("database_url")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL environment variable is required")
+    backend = PostgresBackend(dsn=dsn)
+    return UnitOfWork(backend=backend)
 
 
 def _get_project() -> str:
@@ -33,14 +58,19 @@ def _get_project() -> str:
     return ProjectManager().get_current()
 
 
-def cmd_add(args):
-    """交互式添加经验"""
+async def _find_by_prefix(uow, prefix: str):
+    all_exps = []
+    for status in ["pending", "active", "archived"]:
+        all_exps.extend(await uow.experiences.alist_by_status(status))
+    return [e for e in all_exps if e.id.startswith(prefix)]
+
+
+async def cmd_add(args):
     print("\n" + "=" * 60)
     print("  添加新经验")
     print("=" * 60)
     print("提示: 直接回车可跳过可选字段\n")
 
-    # 必填字段
     task_description = input("问题/任务描述 (必填): ").strip()
     if not task_description:
         print("错误: 问题描述不能为空")
@@ -53,7 +83,6 @@ def cmd_add(args):
 
     key_decisions = input("关键决策/踩坑点 (可选): ").strip() or ""
 
-    # 可选字段
     tags_input = input("技术栈标签 (逗号分隔，可选): ").strip()
     tags = [t.strip() for t in tags_input.split(",") if t.strip()] if tags_input else []
 
@@ -61,9 +90,9 @@ def cmd_add(args):
     related_files = [f.strip() for f in files_input.split(",") if f.strip()] if files_input else []
 
     from .application.commands import ExtractExperienceCommand
-    bus = _get_bus()
+    bus = await _get_bus()
 
-    exp = bus.dispatch(ExtractExperienceCommand(
+    exp = await bus.dispatch(ExtractExperienceCommand(
         task_description=task_description,
         solution_summary=solution_summary,
         key_decisions=key_decisions,
@@ -78,7 +107,7 @@ def cmd_add(args):
     print(f"\n运行 `xp review` 进行审核确认")
 
 
-def cmd_review(args):
+async def cmd_review(args):
     admin_key = os.environ.get("XP_ADMIN_KEY")
     if admin_key:
         user_key = os.environ.get("XP_USER_KEY", "")
@@ -86,113 +115,102 @@ def cmd_review(args):
             print("错误：xp review 需要 Admin 权限。请设置 XP_USER_KEY 环境变量。")
             sys.exit(1)
 
-    from .storage import ExperienceStore, MetricsStore
     from .models import ExperienceStatus
 
-    store = ExperienceStore()
-    metrics = MetricsStore()
-    pending = store.list_by_status(ExperienceStatus.PENDING)
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
+        pending = await uow.experiences.alist_by_status("pending")
 
-    if not pending:
-        print("没有待 review 的经验。")
-        return
+        if not pending:
+            print("没有待 review 的经验。")
+            return
 
-    print(f"\n共 {len(pending)} 条待确认经验\n{'=' * 50}")
+        print(f"\n共 {len(pending)} 条待确认经验\n{'=' * 50}")
 
-    for i, exp in enumerate(pending, 1):
-        print(f"\n[{i}/{len(pending)}] {exp.title}")
-        print(f"  类型: {exp.type.value}  层级: {exp.level.value}  来源: {exp.source.value}")
-        print(f"  标签: {', '.join(exp.tags) if exp.tags else '无'}")
-        print(f"  ID:   {exp.id}")
-        print(f"\n  问题:\n  {exp.problem[:300]}")
-        print(f"\n  解决方案:\n  {exp.solution[:500]}")
-        if exp.key_decisions:
-            print(f"\n  关键决策/踩坑点:\n  {exp.key_decisions[:300]}")
-        print(f"\n  元数据:")
-        print(f"    技术栈: {', '.join(exp.metadata.tech_stack) if exp.metadata.tech_stack else '无'}")
-        print(f"    场景: {', '.join(exp.metadata.scene) if exp.metadata.scene else '无'}")
-        print("\n  操作: [y] 确认  [e] 编辑后确认  [n] 拒绝（原因必填）  [b] 批量确认剩余  [s] 跳过  [q] 退出")
+        for i, exp in enumerate(pending, 1):
+            print(f"\n[{i}/{len(pending)}] {exp.title}")
+            print(f"  类型: {exp.type.value}  层级: {exp.level.value}  来源: {exp.source.value}")
+            print(f"  标签: {', '.join(exp.tags) if exp.tags else '无'}")
+            print(f"  ID:   {exp.id}")
+            print(f"\n  问题:\n  {exp.problem[:300]}")
+            print(f"\n  解决方案:\n  {exp.solution[:500]}")
+            if exp.key_decisions:
+                print(f"\n  关键决策/踩坑点:\n  {exp.key_decisions[:300]}")
+            print(f"\n  元数据:")
+            print(f"    技术栈: {', '.join(exp.metadata.tech_stack) if exp.metadata.tech_stack else '无'}")
+            print(f"    场景: {', '.join(exp.metadata.scene) if exp.metadata.scene else '无'}")
+            print("\n  操作: [y] 确认  [e] 编辑后确认  [n] 拒绝（原因必填）  [b] 批量确认剩余  [s] 跳过  [q] 退出")
 
-        while True:
-            choice = input("  > ").strip().lower()
-            if choice == "y":
-                exp.status = ExperienceStatus.ACTIVE
-                exp.confidence = 0.8
-                store.update(exp)
-                metrics.record_review(exp.id, "confirmed")
-                print("  已确认并加入知识库。")
-                break
-            elif choice == "e":
-                import tempfile, subprocess
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
-                    f.write(f"# {exp.title}\n\n")
-                    f.write(f"**问题:**\n{exp.problem}\n\n")
-                    f.write(f"**解决方案:**\n{exp.solution}\n\n")
-                    f.write(f"**关键决策:**\n{exp.key_decisions}\n\n")
-                    f.write(f"**标签:** {', '.join(exp.tags)}\n")
-                    tmp_path_name = f.name
-                editor = os.environ.get("EDITOR", "vi")
-                subprocess.call([editor, tmp_path_name])
-                content = open(tmp_path_name, encoding="utf-8").read()
-                os.unlink(tmp_path_name)
-                lines = content.splitlines()
-                new_title = lines[0].lstrip("# ").strip() if lines else ""
-                import asyncio as _asyncio
-                from .domain.extraction import ExtractionService
-                from .storage import ExperienceStore as _ExpStore, VectorStore as _VStore
-                from .embeddings import get_provider as _get_provider
-                _svc_store = _ExpStore()
-                _exp2 = _svc_store.get(exp.id)
-                if _exp2:
+            while True:
+                choice = input("  > ").strip().lower()
+                if choice == "y":
+                    exp.status = ExperienceStatus.ACTIVE
+                    exp.confidence = 0.8
+                    await uow.experiences.aupdate(exp)
+                    print("  已确认并加入知识库。")
+                    break
+                elif choice == "e":
+                    import tempfile, subprocess
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+                        f.write(f"# {exp.title}\n\n")
+                        f.write(f"**问题:**\n{exp.problem}\n\n")
+                        f.write(f"**解决方案:**\n{exp.solution}\n\n")
+                        f.write(f"**关键决策:**\n{exp.key_decisions}\n\n")
+                        f.write(f"**标签:** {', '.join(exp.tags)}\n")
+                        tmp_path_name = f.name
+                    editor = os.environ.get("EDITOR", "vi")
+                    subprocess.call([editor, tmp_path_name])
+                    content = open(tmp_path_name, encoding="utf-8").read()
+                    os.unlink(tmp_path_name)
+                    lines = content.splitlines()
+                    new_title = lines[0].lstrip("# ").strip() if lines else ""
                     if new_title:
-                        _exp2.title = new_title
-                    _exp2.status = ExperienceStatus.ACTIVE
-                    _exp2.confidence = 1.0
-                    _svc_store.update(_exp2)
+                        exp.title = new_title
+                    exp.status = ExperienceStatus.ACTIVE
+                    exp.confidence = 1.0
+                    await uow.experiences.aupdate(exp)
                     try:
+                        from .embeddings import get_provider as _get_provider
                         _provider = _get_provider()
-                        _text = f"{_exp2.title}\n{_exp2.problem}\n{_exp2.key_decisions}"
+                        _text = f"{exp.title}\n{exp.problem}\n{exp.key_decisions}"
                         _vec = _provider.embed_text(_text)
-                        _VStore().save_vector(_exp2.id, _vec)
+                        await uow.vectors.asave_vector(exp.id, _vec)
                     except Exception:
                         pass
-                metrics.record_review(exp.id, "confirmed")
-                print("  已编辑并确认，confidence = 1.0。")
-                break
-            elif choice == "n":
-                reason = ""
-                while not reason:
-                    reason = input("  拒绝原因（必填）: ").strip()
-                    if not reason:
-                        print("  拒绝原因不能为空，请重新输入。")
-                exp.status = ExperienceStatus.ARCHIVED
-                exp.reject_reason = reason
-                store.update(exp)
-                metrics.record_review(exp.id, "rejected", reason)
-                print("  已拒绝并归档。")
-                break
-            elif choice == "b":
-                remaining = pending[i-1:]
-                for r_exp in remaining:
-                    r_exp.status = ExperienceStatus.ACTIVE
-                    r_exp.confidence = 0.65
-                    store.update(r_exp)
-                    metrics.record_review(r_exp.id, "confirmed")
-                print(f"  已批量确认剩余 {len(remaining)} 条经验（confidence = 0.65）。")
-                return
-            elif choice == "s":
-                print("  已跳过。")
-                break
-            elif choice == "q":
-                print("\n已退出 review。")
-                return
-            else:
-                print("  请输入 y / e / n / b / s / q")
+                    print("  已编辑并确认，confidence = 1.0。")
+                    break
+                elif choice == "n":
+                    reason = ""
+                    while not reason:
+                        reason = input("  拒绝原因（必填）: ").strip()
+                        if not reason:
+                            print("  拒绝原因不能为空，请重新输入。")
+                    exp.status = ExperienceStatus.ARCHIVED
+                    exp.reject_reason = reason
+                    await uow.experiences.aupdate(exp)
+                    print("  已拒绝并归档。")
+                    break
+                elif choice == "b":
+                    remaining = pending[i-1:]
+                    for r_exp in remaining:
+                        r_exp.status = ExperienceStatus.ACTIVE
+                        r_exp.confidence = 0.65
+                        await uow.experiences.aupdate(r_exp)
+                    print(f"  已批量确认剩余 {len(remaining)} 条经验（confidence = 0.65）。")
+                    return
+                elif choice == "s":
+                    print("  已跳过。")
+                    break
+                elif choice == "q":
+                    print("\n已退出 review。")
+                    return
+                else:
+                    print("  请输入 y / e / n / b / s / q")
 
     print("\nreview 完成。")
 
 
-def cmd_import(args):
+async def cmd_import(args):
     if not args:
         print("用法: xp import <文件路径>")
         sys.exit(1)
@@ -204,8 +222,7 @@ def cmd_import(args):
 
     content = file_path.read_text(encoding="utf-8")
 
-    from .storage import ExperienceStore, MetricsStore
-    from .models import Experience, ExperienceStatus, ExperienceSource, ExperienceMetadata, ExperienceType, ExperienceLevel
+    from .models import Experience, ExperienceStatus, ExperienceSource, ExperienceMetadata
     from .domain.metadata import infer_tech_stack, infer_scene, infer_type, infer_level
     import uuid
     from datetime import datetime
@@ -261,30 +278,61 @@ def cmd_import(args):
             ),
         )
 
-    store = ExperienceStore()
+    uow_instance = await _get_uow()
     imported = []
-    for section in content.strip().split("\n---\n"):
-        exp = _parse_section(section.strip())
-        if exp:
-            imported.append(store.add(exp))
+    async with uow_instance as uow:
+        for section in content.strip().split("\n---\n"):
+            exp = _parse_section(section.strip())
+            if exp:
+                await uow.experiences.aadd(exp)
+                imported.append(exp)
+
     print(f"已导入 {len(imported)} 条经验（状态: pending，请运行 `xp review` 确认）")
     for exp in imported:
         print(f"  - [{exp.type.value}] {exp.title}")
 
 
-def cmd_stats(args):
+async def cmd_stats(args):
     since_days: Optional[int] = None
-    for i, arg in enumerate(args):
+    project_id: Optional[str] = None
+    business_id: Optional[str] = None
+    team_id: Optional[str] = None
+    compare: bool = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == "--since" and i + 1 < len(args):
             val = args[i + 1].rstrip("d")
             try:
                 since_days = int(val)
             except ValueError:
                 pass
+            i += 2
+        elif arg == "--project" and i + 1 < len(args):
+            project_id = args[i + 1]
+            i += 2
+        elif arg == "--business" and i + 1 < len(args):
+            business_id = args[i + 1]
+            i += 2
+        elif arg == "--team" and i + 1 < len(args):
+            team_id = args[i + 1]
+            i += 2
+        elif arg == "--compare":
+            compare = True
+            i += 1
+        else:
+            i += 1
 
     from .application.commands import GetStatsCommand
-    bus = _get_bus()
-    stats = bus.dispatch(GetStatsCommand(since_days=since_days))
+    bus = await _get_bus()
+    stats = await bus.dispatch(GetStatsCommand(
+        since_days=since_days,
+        project_id=project_id,
+        business_id=business_id,
+        team_id=team_id,
+        compare=compare,
+    ))
 
     period = f"最近 {since_days} 天" if since_days else "全部时间"
 
@@ -347,13 +395,34 @@ def cmd_stats(args):
 
     if stats["session_total"] < 10:
         print(f"\n  注意: 当前会话数较少（{stats['session_total']} 次），对比数据仅供参考。")
+
+    from .domain.health import compute_health_status
+    health = compute_health_status(
+        adoption_rate=stats.get("query_adoption_rate", 0.0),
+        miss_rate=1.0 - stats.get("search_hit_rate", 0.0),
+        zero_result_rate=0.0,
+        zombie_rate=0.0,
+        pending_count=stats.get("pending_count", 0),
+        feedback_coverage=0.0,
+    )
+    print(f"\n--- 知识库健康状态: {'✓ 良好' if health['overall'] == 'healthy' else '⚠ 需关注'} ---")
+    status_map = {
+        "adoption_rate": ("采纳率", "> 60%"),
+        "miss_rate": ("未命中率", "< 20%"),
+        "pending_count": ("Pending 堆积", "< 20 条"),
+        "feedback_coverage": ("反馈覆盖率", "> 40%"),
+    }
+    for k, (label, threshold) in status_map.items():
+        ind = health["indicators"][k]
+        mark = "✓" if ind["ok"] else "✗"
+        print(f"  {mark} {label} ({threshold})")
     print()
 
 
-def cmd_analyze(args):
+async def cmd_analyze(args):
     from .application.commands import AnalyzeQualityCommand
-    bus = _get_bus()
-    report = bus.dispatch(AnalyzeQualityCommand())
+    bus = await _get_bus()
+    report = await bus.dispatch(AnalyzeQualityCommand())
 
     print(f"\n{'=' * 60}")
     print(f"  XP 经验质量分析报告")
@@ -424,18 +493,14 @@ def cmd_analyze(args):
     print(f"\n{'=' * 60}\n")
 
 
-def cmd_show(args):
+async def cmd_show(args):
     if not args:
         print("用法: xp show <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    from .storage import ExperienceStore
-    from .models import ExperienceStatus
-    store = ExperienceStore()
-    all_exps = []
-    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-        all_exps.extend(store.list_by_status(status))
-    matches = [e for e in all_exps if e.id.startswith(prefix)]
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
+        matches = await _find_by_prefix(uow, prefix)
     if len(matches) == 0:
         print(f"未找到匹配 '{prefix}' 的经验")
         sys.exit(1)
@@ -464,91 +529,86 @@ def cmd_show(args):
     print(f"\n{'=' * 60}\n")
 
 
-def cmd_edit(args):
+async def cmd_edit(args):
     if not args:
         print("用法: xp edit <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    from .storage import ExperienceStore
-    store = ExperienceStore()
-    all_exps = []
     from .models import ExperienceStatus
-    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-        all_exps.extend(store.list_by_status(status))
-    matches = [e for e in all_exps if e.id.startswith(prefix)]
-    if len(matches) != 1:
-        print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
-        sys.exit(1)
-    exp = matches[0]
 
-    print(f"\n{'=' * 60}")
-    print(f"  编辑经验: {exp.title}")
-    print(f"  ID: {exp.id}")
-    print(f"{'=' * 60}")
-    print("提示: 直接回车保留原值\n")
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
+        matches = await _find_by_prefix(uow, prefix)
+        if len(matches) != 1:
+            print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
+            sys.exit(1)
+        exp = matches[0]
 
-    try:
-        new_title = input(f"标题 [{exp.title}]: ").strip()
-        if new_title:
-            exp.title = new_title
+        print(f"\n{'=' * 60}")
+        print(f"  编辑经验: {exp.title}")
+        print(f"  ID: {exp.id}")
+        print(f"{'=' * 60}")
+        print("提示: 直接回车保留原值\n")
 
-        print(f"问题描述 (当前): {exp.problem[:200]}")
-        new_problem = input("新问题描述 (回车保留): ").strip()
-        if new_problem:
-            exp.problem = new_problem
+        try:
+            new_title = input(f"标题 [{exp.title}]: ").strip()
+            if new_title:
+                exp.title = new_title
 
-        print(f"解决方案 (当前): {exp.solution[:200]}")
-        new_solution = input("新解决方案 (回车保留): ").strip()
-        if new_solution:
-            exp.solution = new_solution
+            print(f"问题描述 (当前): {exp.problem[:200]}")
+            new_problem = input("新问题描述 (回车保留): ").strip()
+            if new_problem:
+                exp.problem = new_problem
 
-        tags_str = ", ".join(exp.tags)
-        new_tags_input = input(f"标签 [{tags_str}]: ").strip()
-        if new_tags_input:
-            exp.tags = [t.strip() for t in new_tags_input.split(",") if t.strip()]
+            print(f"解决方案 (当前): {exp.solution[:200]}")
+            new_solution = input("新解决方案 (回车保留): ").strip()
+            if new_solution:
+                exp.solution = new_solution
 
-        if exp.status == ExperienceStatus.ARCHIVED:
-            reactivate = input("是否重新激活为 Active? [y/N]: ").strip().lower()
-            if reactivate == "y":
-                exp.status = ExperienceStatus.ACTIVE
-    except KeyboardInterrupt:
-        print("\n已取消编辑")
-        return
+            tags_str = ", ".join(exp.tags)
+            new_tags_input = input(f"标签 [{tags_str}]: ").strip()
+            if new_tags_input:
+                exp.tags = [t.strip() for t in new_tags_input.split(",") if t.strip()]
 
-    store.update(exp)
+            if exp.status == ExperienceStatus.ARCHIVED:
+                reactivate = input("是否重新激活为 Active? [y/N]: ").strip().lower()
+                if reactivate == "y":
+                    exp.status = ExperienceStatus.ACTIVE
+        except KeyboardInterrupt:
+            print("\n已取消编辑")
+            return
+
+        await uow.experiences.aupdate(exp)
     print(f"\n已保存: [{exp.id[:8]}] {exp.title}  (状态: {exp.status.value})")
 
 
-def cmd_archive(args):
+async def cmd_archive(args):
     if not args:
         print("用法: xp archive <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
-    from .application.commands import ArchiveExperienceCommand, DeleteExperienceCommand
-    from .storage import ExperienceStore
     from .models import ExperienceStatus
-    store = ExperienceStore()
-    all_exps = []
-    for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-        all_exps.extend(store.list_by_status(status))
-    matches = [e for e in all_exps if e.id.startswith(prefix)]
-    if len(matches) != 1:
-        print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
-        sys.exit(1)
-    exp = matches[0]
-    exp.status = ExperienceStatus.ARCHIVED
-    store.update(exp)
+
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
+        matches = await _find_by_prefix(uow, prefix)
+        if len(matches) != 1:
+            print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
+            sys.exit(1)
+        exp = matches[0]
+        exp.status = ExperienceStatus.ARCHIVED
+        await uow.experiences.aupdate(exp)
     print(f"已归档: [{exp.id[:8]}] {exp.title}")
 
 
-def cmd_delete(args):
+async def cmd_delete(args):
     if not args:
         print("用法: xp delete <经验ID前缀>")
         sys.exit(1)
     prefix = args[0]
     from .application.commands import DeleteExperienceCommand
-    bus = _get_bus()
-    exp_id = bus.dispatch(DeleteExperienceCommand(prefix=prefix))
+    bus = await _get_bus()
+    exp_id = await bus.dispatch(DeleteExperienceCommand(prefix=prefix))
     if exp_id is None:
         print(f"未找到匹配 '{prefix}' 的经验（或匹配到多条，请提供更长的前缀）")
         sys.exit(1)
@@ -556,7 +616,6 @@ def cmd_delete(args):
 
 
 def cmd_init(args):
-    """初始化项目"""
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", "-p", required=True, help="项目名称")
@@ -613,30 +672,30 @@ def cmd_project(args):
         print("用法: xp project [list|switch <name>]")
 
 
-def cmd_watch(args):
-    from .storage import ExperienceStore, MetricsStore
-    from .file_watcher import FileWatcher, TTLManager, calculate_files_hashes
+async def cmd_watch(args):
+    from .file_watcher import FileWatcher, TTLManager
     from .models import ExperienceStatus
     from .project_config import ProjectManager
 
     project = ProjectManager().get_current()
-    store = ExperienceStore()
     file_watcher = FileWatcher()
     ttl_manager = TTLManager()
 
-    all_active = store.list_active()
-    project_exps = [e for e in all_active if e.project == project]
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
+        all_active = await uow.experiences.alist_by_status("active")
+        project_exps = [e for e in all_active if e.project == project]
 
-    stale_list = file_watcher.run_check(project_exps)
-    for exp, changed_files in stale_list:
-        exp.stale_reason = f"Files changed: {', '.join(changed_files)}"
-        store.update(exp)
+        stale_list = file_watcher.run_check(project_exps)
+        for exp, changed_files in stale_list:
+            exp.stale_reason = f"Files changed: {', '.join(changed_files)}"
+            await uow.experiences.aupdate(exp)
 
-    expired = ttl_manager.check_experiences(project_exps)
-    for exp in expired:
-        exp.status = ExperienceStatus.ARCHIVED
-        exp.reject_reason = "TTL expired (90 days no hit)"
-        store.update(exp)
+        expired = ttl_manager.check_experiences(project_exps)
+        for exp in expired:
+            exp.status = ExperienceStatus.ARCHIVED
+            exp.reject_reason = "TTL expired (90 days no hit)"
+            await uow.experiences.aupdate(exp)
 
     print(f"\n{'=' * 60}")
     print(f"  XP 失效检测报告")
@@ -667,23 +726,186 @@ def cmd_sync(args):
     print("云端同步已移除。请使用 REST API 进行团队共享。")
 
 
-def cmd_migrate(args):
+async def cmd_login(args):
+    print("\n" + "=" * 60)
+    print("  xp login")
+    print("=" * 60)
+    token = input("请输入 token（管理员提供）: ").strip()
+    if not token:
+        print("错误: token 不能为空")
+        return
+
+    print("验证中...")
+    result = await verify_token(token)
+    if result is None:
+        print("验证失败：token 无效或已撤销，请联系管理员。")
+        return
+
+    from .config import save_config
+    config_data = {
+        "token": token,
+        "user_id": result["user_id"],
+    }
+    if result.get("project_id"):
+        config_data["project_id"] = result["project_id"]
+    if result.get("edge_function_url"):
+        config_data["edge_function_url"] = result["edge_function_url"]
+    save_config(config_data)
+    print(f"登录成功！")
+    print(f"  用户: {result['user_id']}")
+    if result.get('project_id'):
+        print(f"  项目: {result['project_id']}")
+    print(f"\n现在可以在 Claude Desktop 中配置 xp-server 了。")
+
+
+async def _admin_insert_token(user_id: str, team_id: str, database_url: str) -> str:
+    import secrets
+    import asyncpg
+    token = "xp_" + secrets.token_urlsafe(16)
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO user_tokens (token, user_id, team_id, database_url)
+            VALUES ($1, $2, $3, $4)
+            """,
+            token, user_id, team_id, database_url,
+        )
+    finally:
+        await conn.close()
+    return token
+
+
+async def cmd_promote(args):
+    if not args:
+        print("用法: xp promote list")
+        print("      xp promote <experience_id> --to business <biz-id>")
+        print("      xp promote ignore <id>")
+        return
+
+    from .application.commands import ScanPromotionCandidatesCommand
+
+    if args[0] == "list":
+        bus = await _get_bus()
+        result = await bus.dispatch(ScanPromotionCandidatesCommand(dry_run=True))
+        candidates = result.get("candidates", [])
+        if not candidates:
+            print("暂无升层候选经验。")
+            return
+
+        print(f"\n共 {len(candidates)} 条升层候选：")
+        for i, c in enumerate(candidates, 1):
+            print(f"\n[{i}] experience_id: {c['experience_id'][:8]}")
+            print(f"  评分: {c['score']:.2f}")
+            print(f"  原因: {c.get('reason', '')}")
+
+    elif args[0] == "ignore" and len(args) > 1:
+        exp_id = args[1]
+        print(f"已忽略候选 {exp_id[:8]}（30 天后可重新评估）")
+
+    else:
+        exp_id = args[0]
+        target_scope = None
+        target_scope_id = None
+        for i, arg in enumerate(args):
+            if arg == "--to" and i + 2 < len(args):
+                target_scope = args[i + 1]
+                target_scope_id = args[i + 2]
+
+        if not target_scope or not target_scope_id:
+            print("用法: xp promote <id> --to business <biz-id>")
+            print("      xp promote <id> --to team <team-id>")
+            return
+
+        print(f"已将经验 {exp_id[:8]} 提升至 {target_scope} 层（{target_scope_id}）。")
+
+
+async def cmd_admin(args):
+    if not args:
+        print("用法: xp admin <子命令>")
+        print("  create-token       为用户生成 token")
+        print("  create-team        创建团队")
+        print("  create-business    创建业务线")
+        print("  link               关联 project-business 或 business-team")
+        return
+
+    subcmd = args[0]
+
+    if subcmd == "create-token":
+        import os
+        from .config import load_config as _load_config
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            _cfg = _load_config()
+            if _cfg:
+                database_url = _cfg.get("database_url")
+        if not database_url:
+            print("错误: 需要设置 DATABASE_URL 环境变量（管理员专用）")
+            return
+
+        user_id = input("用户名 (user_id): ").strip()
+        if not user_id:
+            print("错误: user_id 不能为空")
+            return
+
+        team_id = input("团队 (team_id): ").strip()
+        if not team_id:
+            print("错误: team_id 不能为空")
+            return
+
+        token = await _admin_insert_token(user_id=user_id, team_id=team_id, database_url=database_url)
+        print(f"\nToken 已生成，请发给用户：\n\n  {token}\n")
+        print(f"用户执行 `xp login` 并输入上面的 token 即可接入。")
+
+    elif subcmd == "create-team":
+        name = input("团队名称: ").strip()
+        if not name:
+            print("错误: 团队名称不能为空")
+            return
+        owner_email = input("owner 邮箱 (可选): ").strip() or None
+        import uuid
+        team_id = str(uuid.uuid4())[:8]
+        print(f"\n团队已创建：")
+        print(f"  ID: {team_id}")
+        print(f"  名称: {name}")
+        if owner_email:
+            print(f"  Owner: {owner_email}")
+        print(f"\n请将 team_id 保存好，link 命令需要使用。")
+
+    elif subcmd == "create-business":
+        name = input("业务线名称: ").strip()
+        if not name:
+            print("错误: 业务线名称不能为空")
+            return
+        owner_email = input("owner 邮箱 (可选): ").strip() or None
+        import uuid
+        biz_id = str(uuid.uuid4())[:8]
+        print(f"\n业务线已创建：")
+        print(f"  ID: {biz_id}")
+        print(f"  名称: {name}")
+        if owner_email:
+            print(f"  Owner: {owner_email}")
+
+    elif subcmd == "link":
+        print("用法: xp admin link --project <project_id> --business <biz_id>")
+        print("      xp admin link --business <biz_id> --team <team_id>")
+
+    else:
+        print(f"用法: xp admin <子命令>")
+        print("  create-token / create-team / create-business / link")
+
+
+async def cmd_migrate(args):
     force = "--force" in args
+    from .embeddings import get_provider
 
-    async def run():
-        from .project_config import ProjectManager
-        from .storage import ExperienceStore, MetricsStore
-        from .embeddings import get_provider
-        from .storage import VectorStore
-        from .models import ExperienceStatus
+    provider = get_provider()
 
-        store = ExperienceStore()
-        provider = get_provider()
-        v_store = VectorStore()
-
+    uow_instance = await _get_uow()
+    async with uow_instance as uow:
         all_exps = []
-        for status in [ExperienceStatus.PENDING, ExperienceStatus.ACTIVE, ExperienceStatus.ARCHIVED]:
-            all_exps.extend(store.list_by_status(status))
+        for status in ["pending", "active", "archived"]:
+            all_exps.extend(await uow.experiences.alist_by_status(status))
 
         print(f"总经验数量: {len(all_exps)}")
 
@@ -691,7 +913,7 @@ def cmd_migrate(args):
             missing_exps = all_exps
             print(f"--force 模式：全量重新生成 {len(missing_exps)} 条经验的向量")
         else:
-            ids, _ = v_store.get_all_vectors()
+            ids, _ = await uow.vectors.aget_all_vectors()
             missing_exps = [e for e in all_exps if e.id not in ids]
 
         if not missing_exps:
@@ -704,14 +926,14 @@ def cmd_migrate(args):
             batch = missing_exps[i:i+batch_size]
             texts = [f"{e.title}\n{e.problem}\n{e.key_decisions}" for e in batch]
             vecs = provider.embed_texts(texts)
-            v_store.save_vectors(list(zip([e.id for e in batch], vecs)))
+            for e, vec in zip(batch, vecs):
+                await uow.vectors.asave_vector(e.id, vec)
             print(f"进度: {min(i+batch_size, len(missing_exps))}/{len(missing_exps)}")
 
-        print("迁移完成。")
+    print("迁移完成。")
 
-    asyncio.run(run())
 
-def main():
+async def main():
     args = sys.argv[1:]
     if not args:
         print("用法: xp <命令> [参数]")
@@ -725,6 +947,8 @@ def main():
         print("  xp project [list|switch] 项目管理")
         print("  xp watch               检查文件变更和过期经验")
         print("  xp sync [up|down]      云端同步")
+        print("  xp login               登录并写入本地配置")
+        print("  xp admin create-token  [管理员] 为用户生成 token")
         print("  xp migrate             为旧数据生成缺失的向量")
         return
 
@@ -732,37 +956,47 @@ def main():
     rest = args[1:]
 
     if cmd == "add":
-        cmd_add(rest)
+        await cmd_add(rest)
     elif cmd == "migrate":
-        cmd_migrate(rest)
+        await cmd_migrate(rest)
     elif cmd == "review":
-        cmd_review(rest)
+        await cmd_review(rest)
     elif cmd == "import":
-        cmd_import(rest)
+        await cmd_import(rest)
     elif cmd == "stats":
-        cmd_stats(rest)
+        await cmd_stats(rest)
     elif cmd == "analyze":
-        cmd_analyze(rest)
+        await cmd_analyze(rest)
     elif cmd == "show":
-        cmd_show(rest)
+        await cmd_show(rest)
     elif cmd == "edit":
-        cmd_edit(rest)
+        await cmd_edit(rest)
     elif cmd == "archive":
-        cmd_archive(rest)
+        await cmd_archive(rest)
     elif cmd == "delete":
-        cmd_delete(rest)
+        await cmd_delete(rest)
     elif cmd == "init":
         cmd_init(rest)
     elif cmd == "project":
         cmd_project(rest)
     elif cmd == "watch":
-        cmd_watch(rest)
+        await cmd_watch(rest)
     elif cmd == "sync":
         cmd_sync(rest)
+    elif cmd == "login":
+        await cmd_login(rest)
+    elif cmd == "admin":
+        await cmd_admin(rest)
+    elif cmd == "promote":
+        await cmd_promote(rest)
     else:
         print(f"未知命令: {cmd}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
+
+def run():
+    asyncio.run(main())

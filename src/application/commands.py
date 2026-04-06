@@ -74,6 +74,10 @@ class RecordSessionCommand:
 @dataclass
 class GetStatsCommand:
     since_days: int | None = None
+    project_id: str | None = None
+    business_id: str | None = None
+    team_id: str | None = None
+    compare: bool = False
 
 
 @dataclass
@@ -106,4 +110,50 @@ class DeleteExperienceCommand:
 
 @dataclass
 class GetExperienceCommand:
+    experience_id: str
+
+
+@dataclass
+class SearchV2Command:
+    task_description: str
+    project_id: str
+    project_manifest: str
+    session_id: str | None = None
+    top_k: int = 5
+
+
+@dataclass
+class SaveCommand:
+    task_description: str
+    solution: str
+    key_decisions: str
+    tags: list[str]
+    project_id: str
+    outcome: str
+    search_event_id: str | None = None
+
+
+@dataclass
+class FeedbackV2Command:
+    search_event_id: str
+    helpful_ids: list[str] = field(default_factory=list)
+    unhelpful_ids: list[str] = field(default_factory=list)
+    comment: str | None = None
+
+
+@dataclass
+class ScanPromotionCandidatesCommand:
+    business_id: str | None = None
+    dry_run: bool = False
+
+
+@dataclass
+class PromoteExperienceCommand:
+    experience_id: str
+    target_scope: str
+    target_scope_id: str
+
+
+@dataclass
+class IgnorePromotionCommand:
     experience_id: str

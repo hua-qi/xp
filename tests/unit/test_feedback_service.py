@@ -31,32 +31,35 @@ def make_exp(confidence=0.6) -> Experience:
 
 
 class TestFeedbackService:
-    def test_returns_false_for_nonexistent(self):
+    @pytest.mark.asyncio
+    async def test_returns_false_for_nonexistent(self):
         uow = InMemoryUnitOfWork()
         handler = FeedbackHandler(lambda: uow)
-        result = handler.handle_feedback(
+        result = await handler.handle_feedback(
             RecordFeedbackCommand(experience_id="nonexistent", helpful=True)
         )
         assert result is False
 
-    def test_adopted_true_increases_confidence(self):
+    @pytest.mark.asyncio
+    async def test_adopted_true_increases_confidence(self):
         exp = make_exp(confidence=0.6)
         uow = InMemoryUnitOfWork()
         uow.experiences._committed[exp.id] = exp
 
         handler = FeedbackHandler(lambda: uow)
-        handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=True))
+        await handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=True))
 
         updated = uow.experiences.get(exp.id)
         assert updated.confidence == round(0.6 + CONFIDENCE_HELPFUL_DELTA, 3)
 
-    def test_low_confidence_auto_archives(self):
+    @pytest.mark.asyncio
+    async def test_low_confidence_auto_archives(self):
         exp = make_exp(confidence=AUTO_ARCHIVE_ADOPTION_THRESHOLD)
         uow = InMemoryUnitOfWork()
         uow.experiences._committed[exp.id] = exp
 
         handler = FeedbackHandler(lambda: uow)
-        handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=False))
+        await handler.handle_feedback(RecordFeedbackCommand(experience_id=exp.id, helpful=False))
 
         updated = uow.experiences.get(exp.id)
         assert updated.status == ExperienceStatus.ARCHIVED

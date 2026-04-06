@@ -27,6 +27,12 @@ class ExperienceSource(str, Enum):
     MANUAL = "manual"
 
 
+class ScopeType(str, Enum):
+    PROJECT = "project"
+    BUSINESS = "business"
+    TEAM = "team"
+
+
 @dataclass
 class ExperienceMetadata:
     """用于检索的结构化元数据，人可读、模型无关"""
@@ -58,6 +64,12 @@ class Experience:
     last_hit_at: Optional[str] = None  # 最后使用时间，用于 TTL
     stale_reason: Optional[str] = None  # 失效原因
     key_decisions: str = ""
+    scope_type: ScopeType = field(default_factory=lambda: ScopeType.PROJECT)
+    scope_id: Optional[str] = None
+    promoted_to: Optional[str] = None
+    demoted_from: Optional[str] = None
+    recall_count: int = 0
+    adoption_rate: float = 0.0
 
 
 @dataclass
@@ -107,3 +119,72 @@ class ExperienceStats:
     def update_adoption_rate(self):
         if self.hit_count > 0:
             self.adoption_rate = round(self.adopted_count / self.hit_count, 3)
+
+
+@dataclass
+class Team:
+    id: str
+    name: str
+    owner_email: Optional[str] = None
+
+
+@dataclass
+class Business:
+    id: str
+    team_id: str
+    name: str
+    owner_email: Optional[str] = None
+
+
+@dataclass
+class Project:
+    id: str
+    business_id: str
+    name: str
+    language: str = ""
+    frameworks: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchEvent:
+    id: str
+    session_id: str
+    project_id: str
+    query_text: str
+    timestamp: str
+    result_ids: list[str] = field(default_factory=list)
+    query_embedding: Optional[list[float]] = None
+
+
+@dataclass
+class FeedbackEvent:
+    id: str
+    search_event_id: str
+    timestamp: str
+    helpful_ids: list[str] = field(default_factory=list)
+    unhelpful_ids: list[str] = field(default_factory=list)
+    comment: Optional[str] = None
+
+
+@dataclass
+class PromotionCandidate:
+    id: str
+    experience_id: str
+    target_scope_type: str
+    target_scope_id: str
+    score: float
+    status: str
+    ignored_at: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ProjectBusinessLink:
+    project_id: str
+    business_id: str
+
+
+@dataclass
+class BusinessTeamLink:
+    business_id: str
+    team_id: str
