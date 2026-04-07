@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -20,3 +21,22 @@ def load_config() -> Optional[dict]:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@dataclass
+class AppConfig:
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    LLM_API_BASE: str = os.getenv("XP_LLM_API_BASE", "")
+    LLM_API_KEY: str = os.getenv("XP_LLM_API_KEY", "")
+    LLM_MODEL: str = os.getenv("XP_LLM_MODEL", "gpt-4o-mini")
+    LLM_TIMEOUT: int = int(os.getenv("XP_LLM_TIMEOUT", "30"))
+
+
+def get_config() -> AppConfig:
+    return AppConfig(
+        DATABASE_URL=os.getenv("DATABASE_URL", ""),
+        LLM_API_BASE=os.getenv("XP_LLM_API_BASE", ""),
+        LLM_API_KEY=os.getenv("XP_LLM_API_KEY", ""),
+        LLM_MODEL=os.getenv("XP_LLM_MODEL", "gpt-4o-mini"),
+        LLM_TIMEOUT=int(os.getenv("XP_LLM_TIMEOUT", "30")),
+    )

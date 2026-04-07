@@ -1,87 +1,125 @@
 from __future__ import annotations
+import json
 import uuid
-from datetime import datetime
-from typing import Callable, Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-import numpy as np
-
-from ..commands import SaveCommand
-from ..unit_of_work import AbstractUnitOfWork
-from ...domain.quality import compute_save_quality_score
-from ...domain.save_domain import initial_confidence_for_outcome
-from ...domain.experience import check_duplicate
 from ...models import (
-    Experience, ExperienceType, ExperienceLevel, ExperienceStatus,
-    ExperienceSource, ExperienceMetadata, ScopeType,
+    Experience, ExperienceType, ExperienceLevel,
+    ExperienceMetadata, ExperienceStatus, ExperienceSource, ScopeType,
 )
-from ...domain.constants import DUPLICATE_SIMILARITY_THRESHOLD
+from ...domain.quality import compute_save_quality_score
+from ..commands import SaveCommand
+
+
+EXTRACTION_PROMPT_TEMPLATE = """你是一个工程经验提炼助手。根据以下任务信息，提炼出结构化的工程经验。
+
+## 输入
+任务描述：{task_description}
+任务结果：{outcome_description}
+结果状态：{outcome}
+
+## 输出要求
+严格按照以下 JSON 格式输出，不要输出其他内容：
+{{
+  "title": "10-20字的经验标题，概括核心问题和解法",
+  "problem": "清晰描述问题场景和背景，50字以上",
+  "solution": "具体的解决方案和步骤，50字以上",
+  "key_decisions": "关键决策点和踩坑点，30字以上",
+  "tags": ["技术栈标签", "最多5个"],
+  "type": "bugfix 或 feature 或 pattern 三选一"
+}}"""
 
 
 class SaveHandler:
-    def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork], embedding_provider: Any):
+    def __init__(self, uow_factory, llm):
         self._uow_factory = uow_factory
-        self._provider = embedding_provider
+        self._llm = llm
 
-    async def handle(self, cmd: SaveCommand) -> dict:
-        quality_score = compute_save_quality_score(
-            solution=cmd.solution,
-            key_decisions=cmd.key_decisions,
-            tags=cmd.tags,
+    async def handle(self, cmd: SaveCommand) -> dict[str, Any]:
+        extracted = await self._extract(cmd)
+        if extracted is None:
+            return await self._save_pending(cmd)
+        return await self._save_active(cmd, extracted)
+
+    async def _extract(self, cmd: SaveCommand) -> Optional[dict]:
+        prompt = EXTRACTION_PROMPT_TEMPLATE.format(
+            task_description=cmd.task_description,
+            outcome_description=cmd.outcome_description,
             outcome=cmd.outcome,
         )
+        raw = await self._llm.call(prompt)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw.strip())
+            for key in ("title", "problem", "solution", "key_decisions", "tags", "type"):
+                if key not in data:
+                    return None
+            return data
+        except (json.JSONDecodeError, KeyError):
+            return None
 
-        confidence = initial_confidence_for_outcome(cmd.outcome)
-        status = ExperienceStatus.ACTIVE if quality_score >= 80 else ExperienceStatus.PENDING
-
-        embed_text = f"{cmd.task_description} {cmd.solution} {cmd.key_decisions}"
-        new_vec = np.array(self._provider.embed_text(embed_text), dtype=np.float32)
-
-        duplicate_warning = None
+    async def _save_pending(self, cmd: SaveCommand) -> dict[str, Any]:
+        exp_id = str(uuid.uuid4())
+        exp = Experience(
+            id=exp_id,
+            type=ExperienceType.PATTERN,
+            level=ExperienceLevel.L1,
+            title="(待 LLM 提炼)",
+            tags=[],
+            problem=cmd.task_description,
+            solution=cmd.outcome_description,
+            key_decisions="",
+            confidence=0.5,
+            status=ExperienceStatus.PENDING,
+            source=ExperienceSource.AGENT,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            metadata=ExperienceMetadata(),
+            project=cmd.project_id,
+            scope_type=ScopeType.PROJECT,
+            scope_id=cmd.project_id,
+            retry_count=3,
+            raw_input={
+                "task_description": cmd.task_description,
+                "outcome_description": cmd.outcome_description,
+                "outcome": cmd.outcome,
+            },
+        )
         async with self._uow_factory() as uow:
-            active_exps = await uow.experiences.alist_by_status("active")
-            pending_exps = await uow.experiences.alist_by_status("pending")
-            project_exps = [
-                e for e in active_exps
-                if getattr(e, "scope_id", None) == cmd.project_id
-            ] + [
-                e for e in pending_exps
-                if getattr(e, "scope_id", None) == cmd.project_id
-            ]
-
-            if project_exps:
-                exp_ids = [e.id for e in project_exps]
-                existing_ids, existing_vecs = await uow.vectors.aget_all_vectors(exp_ids)
-                if existing_ids and existing_vecs.size > 0:
-                    is_dup, dup_id, dup_score = check_duplicate(new_vec, existing_vecs, existing_ids)
-                    if is_dup and dup_score >= DUPLICATE_SIMILARITY_THRESHOLD:
-                        duplicate_warning = f"与经验 {dup_id} 相似度 {dup_score:.2f}，请确认是否需要合并"
-
-            exp_id = str(uuid.uuid4())
-            exp = Experience(
-                id=exp_id,
-                type=ExperienceType.BUGFIX,
-                level=ExperienceLevel.L1,
-                title=cmd.task_description[:60],
-                tags=cmd.tags,
-                problem=cmd.task_description,
-                solution=cmd.solution,
-                key_decisions=cmd.key_decisions,
-                confidence=confidence,
-                status=status,
-                source=ExperienceSource.AGENT,
-                created_at=datetime.utcnow().isoformat(),
-                metadata=ExperienceMetadata(tech_stack=cmd.tags),
-                scope_type=ScopeType.PROJECT,
-                scope_id=cmd.project_id,
-            )
             await uow.experiences.aadd(exp)
-            await uow.vectors.asave_vector(exp_id, new_vec.tolist())
+        return {"status": "pending_retry", "experience_id": exp_id}
 
-        result = {
-            "experience_id": exp_id,
-            "status": status.value,
-            "quality_score": quality_score,
-        }
-        if duplicate_warning:
-            result["duplicate_warning"] = duplicate_warning
-        return result
+    async def _save_active(self, cmd: SaveCommand, extracted: dict) -> dict[str, Any]:
+        exp_id = str(uuid.uuid4())
+        type_map = {"bugfix": ExperienceType.BUGFIX, "feature": ExperienceType.FEATURE}
+        exp_type = type_map.get(extracted["type"], ExperienceType.PATTERN)
+        exp = Experience(
+            id=exp_id,
+            type=exp_type,
+            level=ExperienceLevel.L1,
+            title=extracted["title"],
+            tags=extracted.get("tags", []),
+            problem=extracted["problem"],
+            solution=extracted["solution"],
+            key_decisions=extracted.get("key_decisions", ""),
+            confidence=0.6,
+            status=ExperienceStatus.ACTIVE,
+            source=ExperienceSource.AGENT,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            metadata=ExperienceMetadata(),
+            project=cmd.project_id,
+            scope_type=ScopeType.PROJECT,
+            scope_id=cmd.project_id,
+        )
+        quality = compute_save_quality_score(
+            solution=exp.solution,
+            key_decisions=exp.key_decisions,
+            tags=exp.tags,
+            outcome=cmd.outcome,
+        )
+        if quality < 80:
+            exp.status = ExperienceStatus.PENDING
+        async with self._uow_factory() as uow:
+            await uow.experiences.aadd(exp)
+        return {"status": "saved", "experience_id": exp_id, "quality": quality}

@@ -62,41 +62,38 @@ async def test_async_dispatch_unregistered_raises():
 import inspect
 
 
-def test_build_command_bus_is_async():
+def test_build_command_bus_is_sync():
     from src.container import build_command_bus
-    assert inspect.iscoroutinefunction(build_command_bus)
+    assert not inspect.iscoroutinefunction(build_command_bus)
 
 
 class TestCommandBusNewCommands:
-    @pytest.mark.asyncio
-    async def test_search_v2_command_is_registered(self):
+    def test_search_v2_command_is_registered(self):
         from src.container import build_command_bus
-        from unittest.mock import patch, AsyncMock, MagicMock
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}):
-            with patch("src.infrastructure.backends.postgres.asyncpg") as mock_pg:
-                mock_pool = MagicMock()
-                mock_pg.create_pool = AsyncMock(return_value=mock_pool)
-                bus = await build_command_bus()
+        from unittest.mock import MagicMock
+        bus = build_command_bus(
+            backend=MagicMock(),
+            llm=MagicMock(),
+            embedding_provider=MagicMock(),
+        )
         assert SearchV2Command in bus._handlers
 
-    @pytest.mark.asyncio
-    async def test_save_command_is_registered(self):
+    def test_save_command_is_registered(self):
         from src.container import build_command_bus
-        from unittest.mock import patch, AsyncMock, MagicMock
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}):
-            with patch("src.infrastructure.backends.postgres.asyncpg") as mock_pg:
-                mock_pool = MagicMock()
-                mock_pg.create_pool = AsyncMock(return_value=mock_pool)
-                bus = await build_command_bus()
+        from unittest.mock import MagicMock
+        bus = build_command_bus(
+            backend=MagicMock(),
+            llm=MagicMock(),
+            embedding_provider=MagicMock(),
+        )
         assert SaveCommand in bus._handlers
 
-    @pytest.mark.asyncio
-    async def test_feedback_v2_command_is_registered(self):
+    def test_feedback_v2_command_is_registered(self):
         from src.container import build_command_bus
-        from unittest.mock import patch, AsyncMock, MagicMock
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}):
-            with patch("src.infrastructure.backends.postgres.asyncpg") as mock_pg:
-                mock_pool = MagicMock()
-                mock_pg.create_pool = AsyncMock(return_value=mock_pool)
-                bus = await build_command_bus()
+        from unittest.mock import MagicMock
+        bus = build_command_bus(
+            backend=MagicMock(),
+            llm=MagicMock(),
+            embedding_provider=MagicMock(),
+        )
         assert FeedbackV2Command in bus._handlers

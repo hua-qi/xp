@@ -20,6 +20,7 @@ class ExperienceStatus(str, Enum):
     PENDING = "pending"
     ACTIVE = "active"
     ARCHIVED = "archived"
+    NEEDS_FIX = "needs_fix"
 
 
 class ExperienceSource(str, Enum):
@@ -70,6 +71,10 @@ class Experience:
     demoted_from: Optional[str] = None
     recall_count: int = 0
     adoption_rate: float = 0.0
+    ab_group: str = "B"
+    conflict_with: Optional[str] = None
+    retry_count: int = 0
+    raw_input: Optional[dict] = None
 
 
 @dataclass
@@ -188,3 +193,29 @@ class ProjectBusinessLink:
 class BusinessTeamLink:
     business_id: str
     team_id: str
+
+
+@dataclass
+class ConflictReview:
+    id: str
+    experience_id_a: str
+    experience_id_b: str
+    conflict_type: str
+    status: str = "pending"
+    resolution: Optional[str] = None
+    condition_note: Optional[str] = None
+    resolved_at: Optional[str] = None
+    created_at: str = ""
+
+
+@dataclass
+class CorrectionRequest:
+    id: str
+    experience_id: str
+    session_id: str
+    comment: str
+    task_description: str
+    outcome_description: str
+    status: str = "pending"
+    fixed_at: Optional[str] = None
+    created_at: str = ""

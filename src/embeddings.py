@@ -9,6 +9,8 @@ from typing import Optional
 
 import numpy as np
 
+EMBEDDING_DIM = 1024
+
 def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
     """计算余弦相似度
     Args:
@@ -32,7 +34,7 @@ class EmbeddingProvider(abc.ABC):
 
 
 class LocalBGEProvider(EmbeddingProvider):
-    def __init__(self, model_name: str = "BAAI/bge-small-zh-v1.5"):
+    def __init__(self, model_name: str = "BAAI/bge-m3"):
         self._model_name = model_name
         self._model = None
 

@@ -117,27 +117,24 @@ class GetExperienceCommand:
 class SearchV2Command:
     task_description: str
     project_id: str
-    project_manifest: str
     session_id: str | None = None
-    top_k: int = 5
+    top_k: int = 3
 
 
 @dataclass
 class SaveCommand:
     task_description: str
-    solution: str
-    key_decisions: str
-    tags: list[str]
-    project_id: str
+    outcome_description: str
     outcome: str
-    search_event_id: str | None = None
+    project_id: str
+    session_id: str | None = None
 
 
 @dataclass
 class FeedbackV2Command:
-    search_event_id: str
-    helpful_ids: list[str] = field(default_factory=list)
-    unhelpful_ids: list[str] = field(default_factory=list)
+    session_id: str
+    adopted_ids: list[str] = field(default_factory=list)
+    rejected_ids: list[str] = field(default_factory=list)
     comment: str | None = None
 
 

@@ -1,95 +1,89 @@
 from __future__ import annotations
+import json
 import uuid
-from datetime import datetime
-from typing import Callable, Any
+from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 
 from ..commands import SearchV2Command
-from ..unit_of_work import AbstractUnitOfWork
-from ...domain.manifest_parser import parse_manifest
-from ...domain.search_v2 import (
-    apply_scope_weight,
-    apply_tech_stack_boost,
-    merge_and_deduplicate,
-    ScopeWeightedResult,
-)
-from ...models import ScopeType, SearchEvent
+from ...models import Session
 
 
 class SearchV2Handler:
-    def __init__(self, uow_factory: Callable[[], AbstractUnitOfWork], embedding_provider: Any):
-        self._uow_factory = uow_factory
-        self._provider = embedding_provider
+    def __init__(self, backend, llm, embedding_provider):
+        self._backend = backend
+        self._llm = llm
+        self._embed = embedding_provider
 
-    async def handle(self, cmd: SearchV2Command) -> dict:
-        manifest_info = parse_manifest(cmd.project_manifest)
-        language = manifest_info["language"]
-        frameworks = manifest_info["frameworks"]
-        top_deps = manifest_info["top_dependencies"]
+    async def handle(self, cmd: SearchV2Command) -> dict[str, Any]:
+        ab_group = await self._backend.async_get_ab_group(cmd.project_id)
+        session_id = str(uuid.uuid4())
 
-        query_text = f"{cmd.task_description} {language} {' '.join(top_deps)}"
-        query_vec = np.array(self._provider.embed_text(query_text), dtype=np.float32)
+        if ab_group == "A":
+            results = await self._a_group_search(cmd)
+        else:
+            exp_ids, vecs = await self._backend.async_get_vectors_by_project(cmd.project_id)
+            results = await self._b_group_search(cmd.task_description, exp_ids, vecs)
 
-        async with self._uow_factory() as uow:
-            all_exps = uow.experiences.list_by_status("active")
+        await self._backend.async_record_session(
+            Session(
+                session_id=session_id,
+                task_description=cmd.task_description,
+                experience_ids_injected=[r["id"] for r in results],
+                iteration_count=1,
+                had_error_correction=False,
+                user_accepted=True,
+                ab_test_group=ab_group,
+                ab_test_result_shown=True,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        return {"session_id": session_id, "experiences": results[:cmd.top_k]}
 
-            project_exps = [e for e in all_exps if e.scope_type == ScopeType.PROJECT and e.scope_id == cmd.project_id]
-            business_exps = [e for e in all_exps if e.scope_type == ScopeType.BUSINESS]
-            team_exps = [e for e in all_exps if e.scope_type == ScopeType.TEAM]
+    async def _a_group_search(self, cmd: SearchV2Command) -> list[dict]:
+        exps = await self._backend.async_fulltext_search(
+            cmd.task_description, cmd.project_id, limit=20
+        )
+        if not exps:
+            return []
+        candidates = "\n".join(
+            f"ID: {e.id}\n标题: {e.title}\n问题: {e.problem}\n方案: {e.solution}"
+            for e in exps[:10]
+        )
+        prompt = (
+            f"根据以下任务描述，从候选经验中选出最相关的至多3条。\n\n"
+            f"## 任务\n{cmd.task_description}\n\n"
+            f"## 候选经验\n{candidates}\n\n"
+            f"只输出 JSON 数组，包含最相关的经验 ID，按相关度降序排列。"
+        )
+        raw = await self._llm.call(prompt)
+        if not raw:
+            return []
+        try:
+            ids = json.loads(raw.strip())
+            id_map = {e.id: e for e in exps}
+            return [
+                {"id": eid, "title": id_map[eid].title, "problem": id_map[eid].problem}
+                for eid in ids
+                if eid in id_map
+            ]
+        except Exception:
+            return []
 
-            weighted_results: list[ScopeWeightedResult] = []
-            for scope_exps, scope_name in [
-                (project_exps, "project"),
-                (business_exps, "business"),
-                (team_exps, "team"),
-            ]:
-                for exp in scope_exps:
-                    vec = await self._get_or_compute_vector(exp, uow)
-                    if vec is None:
-                        continue
-                    raw_score = float(np.dot(query_vec, vec) / (np.linalg.norm(query_vec) * np.linalg.norm(vec) + 1e-9))
-                    if raw_score < 0.5:
-                        continue
-                    boosted = apply_tech_stack_boost(
-                        score=raw_score,
-                        exp_tags=exp.tags,
-                        query_languages=[language] + frameworks,
-                        query_dependencies=top_deps,
-                    )
-                    final_score = apply_scope_weight(score=boosted, scope_type=scope_name)
-                    weighted_results.append(ScopeWeightedResult(exp_id=exp.id, score=final_score, scope_type=scope_name))
-
-        merged = merge_and_deduplicate(weighted_results, top_k=cmd.top_k, threshold=0.0)
-
-        exp_map = {e.id: e for e in all_exps}
+    async def _b_group_search(
+        self, task_description: str, exp_ids: list[str], vecs: np.ndarray
+    ) -> list[dict]:
+        if len(exp_ids) == 0 or (hasattr(vecs, "size") and vecs.size == 0):
+            return []
+        query_vec = np.array(
+            self._embed.embed_text(task_description), dtype=np.float32
+        )
+        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-9)
+        scores = vecs @ query_vec
+        top_indices = np.argsort(scores)[::-1]
         results = []
-        for r in merged:
-            exp = exp_map.get(r.exp_id)
-            if exp:
-                results.append({
-                    "id": exp.id,
-                    "title": exp.title,
-                    "level": exp.level.value,
-                    "source_level": r.scope_type,
-                    "tags": exp.tags,
-                    "problem": exp.problem,
-                    "solution": exp.solution,
-                    "key_decisions": exp.key_decisions,
-                    "score": round(r.score, 3),
-                })
-
-        search_event_id = str(uuid.uuid4())
-        return {
-            "search_event_id": search_event_id,
-            "results": results,
-        }
-
-    async def _get_or_compute_vector(self, exp, uow) -> "np.ndarray | None":
-        ids, vecs = uow.vectors.get_all_vectors([exp.id])
-        if ids and len(vecs) > 0:
-            return np.array(vecs[0], dtype=np.float32)
-        embed_text = f"{exp.title} {exp.solution} {exp.key_decisions}"
-        vec = self._provider.embed_text(embed_text)
-        uow.vectors.save_vector(exp.id, vec)
-        return np.array(vec, dtype=np.float32)
+        for idx in top_indices:
+            if float(scores[idx]) >= 0.5:
+                results.append({"id": exp_ids[idx], "score": float(scores[idx])})
+        return results[:3]

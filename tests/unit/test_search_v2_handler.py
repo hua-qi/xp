@@ -1,11 +1,13 @@
 import pytest
+from unittest.mock import AsyncMock
+from tests.helpers.fake_uow import InMemoryUnitOfWork
 from src.application.commands import SearchV2Command
 from src.application.handlers.search_v2_handler import SearchV2Handler
-from tests.helpers.fake_uow import InMemoryUnitOfWork
 from src.models import (
     Experience, ExperienceType, ExperienceLevel, ExperienceStatus,
-    ExperienceSource, ExperienceMetadata, ScopeType, SearchEvent,
+    ExperienceSource, ExperienceMetadata, ScopeType,
 )
+import numpy as np
 
 
 def make_active_exp(exp_id, scope_type=ScopeType.PROJECT, scope_id="proj-001", tags=None):
@@ -28,85 +30,72 @@ def make_active_exp(exp_id, scope_type=ScopeType.PROJECT, scope_id="proj-001", t
     )
 
 
+def make_fake_backend(experiences=None):
+    backend = AsyncMock()
+    exps = experiences or []
+    backend.async_get_ab_group = AsyncMock(return_value="B")
+    backend.async_get_experiences_by_project = AsyncMock(return_value=exps)
+    ids = [e.id for e in exps]
+    vecs = np.ones((len(exps), 2), dtype=np.float32) if exps else np.array([])
+    backend.async_get_vectors_by_project = AsyncMock(return_value=(ids, vecs))
+    backend.async_record_session = AsyncMock()
+    return backend
+
+
 class FakeEmbeddingProvider:
     def embed_text(self, text: str) -> list[float]:
-        import numpy as np
-        v = np.ones(64, dtype=np.float32)
+        v = np.ones(2, dtype=np.float32)
         return (v / np.linalg.norm(v)).tolist()
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(self, texts):
         return [self.embed_text(t) for t in texts]
 
 
 class TestSearchV2HandlerReturnsResults:
-    def _make_handler_and_uow(self):
-        uow = InMemoryUnitOfWork()
+    def _make_handler(self, backend=None, experiences=None):
+        if backend is None:
+            backend = make_fake_backend(experiences)
+        llm = AsyncMock()
         provider = FakeEmbeddingProvider()
-        handler = SearchV2Handler(uow_factory=lambda: uow, embedding_provider=provider)
-        return handler, uow
+        handler = SearchV2Handler(backend=backend, llm=llm, embedding_provider=provider)
+        return handler, backend
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_active_experiences(self):
-        handler, uow = self._make_handler_and_uow()
-        cmd = SearchV2Command(
-            task_description="修复 bug",
-            project_id="proj-001",
-            project_manifest="",
-        )
+        handler, _ = self._make_handler()
+        cmd = SearchV2Command(task_description="修复 bug", project_id="proj-001")
         result = await handler.handle(cmd)
-        assert result["results"] == []
+        assert isinstance(result["experiences"], list)
+        assert result["experiences"] == []
 
     @pytest.mark.asyncio
-    async def test_returns_search_event_id(self):
-        handler, uow = self._make_handler_and_uow()
+    async def test_returns_session_id(self):
         exp = make_active_exp("exp-001", scope_id="proj-001")
-        uow.experiences._committed["exp-001"] = exp
-        uow.vectors.save_vector("exp-001", FakeEmbeddingProvider().embed_text("test"))
-
+        handler, _ = self._make_handler(experiences=[exp])
         cmd = SearchV2Command(
             task_description="修复 bug",
             project_id="proj-001",
-            project_manifest='{"dependencies": {"fastapi": "^0.110"}}',
             session_id="sess-001",
         )
         result = await handler.handle(cmd)
-        assert "search_event_id" in result
-        assert result["search_event_id"] is not None
+        assert "session_id" in result
+        assert result["session_id"] is not None
 
     @pytest.mark.asyncio
     async def test_project_scope_results_included(self):
-        handler, uow = self._make_handler_and_uow()
         exp = make_active_exp("exp-001", scope_type=ScopeType.PROJECT, scope_id="proj-001")
-        uow.experiences._committed["exp-001"] = exp
-        uow.vectors.save_vector("exp-001", FakeEmbeddingProvider().embed_text("test"))
-
-        cmd = SearchV2Command(
-            task_description="修复 bug",
-            project_id="proj-001",
-            project_manifest="",
-        )
+        handler, _ = self._make_handler(experiences=[exp])
+        cmd = SearchV2Command(task_description="修复 bug", project_id="proj-001")
         result = await handler.handle(cmd)
-        ids = [r["id"] for r in result["results"]]
+        ids = [r["id"] for r in result["experiences"]]
         assert "exp-001" in ids
 
     @pytest.mark.asyncio
     async def test_results_contain_required_fields(self):
-        handler, uow = self._make_handler_and_uow()
         exp = make_active_exp("exp-001", scope_id="proj-001")
-        uow.experiences._committed["exp-001"] = exp
-        uow.vectors.save_vector("exp-001", FakeEmbeddingProvider().embed_text("test"))
-
-        cmd = SearchV2Command(
-            task_description="修复 bug",
-            project_id="proj-001",
-            project_manifest="",
-        )
+        handler, _ = self._make_handler(experiences=[exp])
+        cmd = SearchV2Command(task_description="修复 bug", project_id="proj-001")
         result = await handler.handle(cmd)
-        if result["results"]:
-            r = result["results"][0]
+        if result["experiences"]:
+            r = result["experiences"][0]
             assert "id" in r
-            assert "title" in r
-            assert "solution" in r
-            assert "key_decisions" in r
-            assert "source_level" in r
-            assert "tags" in r

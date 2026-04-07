@@ -112,19 +112,19 @@ async def build_command_bus(project: str = "default", dsn: str = None) -> Comman
     from .embeddings import get_provider
     embedding_provider = get_provider()
 
-    search_event_store_instance = _InMemorySearchEventStore()
-
     search_v2_handler = SearchV2Handler(
-        uow_factory=uow_factory,
+        backend=backend,
+        llm=None,
         embedding_provider=embedding_provider,
     )
     save_handler_v2 = SaveHandler(
         uow_factory=uow_factory,
-        embedding_provider=embedding_provider,
+        llm=None,
     )
     feedback_v2_handler = FeedbackV2Handler(
         uow_factory=uow_factory,
-        search_event_store=search_event_store_instance,
+        backend=backend,
+        llm=None,
     )
 
     bus.register(SearchV2Command, search_v2_handler.handle)
@@ -140,12 +140,28 @@ async def build_command_bus(project: str = "default", dsn: str = None) -> Comman
     return bus
 
 
-class _InMemorySearchEventStore:
-    def __init__(self):
-        self._events = {}
+def build_command_bus(  # type: ignore[no-redef]
+    backend=None,
+    llm=None,
+    embedding_provider=None,
+) -> CommandBus:
+    bus = CommandBus()
 
-    def save(self, event):
-        self._events[event.id] = event
+    if backend is not None:
+        def uow_factory():
+            return UnitOfWork(backend=backend)
 
-    def get(self, event_id: str):
-        return self._events.get(event_id)
+        bus.register(
+            SearchV2Command,
+            SearchV2Handler(backend=backend, llm=llm, embedding_provider=embedding_provider).handle,
+        )
+        bus.register(
+            SaveCommand,
+            SaveHandler(uow_factory=uow_factory, llm=llm).handle,
+        )
+        bus.register(
+            FeedbackV2Command,
+            FeedbackV2Handler(uow_factory=uow_factory, backend=backend, llm=llm).handle,
+        )
+
+    return bus

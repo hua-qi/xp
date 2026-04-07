@@ -79,3 +79,35 @@ async def test_inmemory_uow_async_rollback_on_exception():
         pass
     assert uow.committed is False
 
+
+def test_in_memory_store_filters_needs_fix_status():
+    from tests.helpers.fake_uow import InMemoryUnitOfWork
+    uow = InMemoryUnitOfWork()
+
+    from src.models import (
+        Experience, ExperienceType, ExperienceLevel,
+        ExperienceSource, ExperienceMetadata, ExperienceStatus,
+    )
+    from datetime import datetime, timezone
+
+    exp = Experience(
+        id="test-1",
+        type=ExperienceType.BUGFIX,
+        level=ExperienceLevel.L1,
+        title="test",
+        tags=[],
+        problem="p",
+        solution="s",
+        key_decisions="",
+        confidence=0.6,
+        status=ExperienceStatus.NEEDS_FIX,
+        source=ExperienceSource.AGENT,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        metadata=ExperienceMetadata(),
+        project="proj-1",
+    )
+    uow.experiences._committed["test-1"] = exp
+    results = uow.experiences.list_by_status("needs_fix")
+    assert len(results) == 1
+    assert results[0].id == "test-1"
+

@@ -52,3 +52,14 @@ def test_config_token_only_is_valid(tmp_path, monkeypatch):
     result = cfg_module.load_config()
     assert result["token"] == "xp_abc"
     assert "database_url" not in result
+
+
+def test_llm_config_defaults():
+    import os
+    os.environ.pop("XP_LLM_MODEL", None)
+    os.environ.pop("XP_LLM_TIMEOUT", None)
+    from importlib import reload
+    import src.config as cfg
+    reload(cfg)
+    assert cfg.get_config().LLM_MODEL == "gpt-4o-mini"
+    assert cfg.get_config().LLM_TIMEOUT == 30
